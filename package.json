@@ -1,0 +1,33 @@
+{
+  "name": "epic-mychart-connector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A secure patient-facing Epic MyChart SMART-on-FHIR connector",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "check:epic": "node --env-file-if-exists=.env --import tsx src/check-epic.ts",
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "keys:generate": "node --import tsx src/generate-key.ts",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tokens:purge": "node --env-file-if-exists=.env --import tsx src/purge-tokens.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^10.0.1",
+    "fastify": "^5.6.2",
+    "jose": "^6.1.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.24",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  }
+}
