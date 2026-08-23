@@ -13,27 +13,12 @@ import { dirname } from "node:path";
 import { z } from "zod";
 
 import { AppError } from "./errors.js";
+import { connectionRecordSchema } from "./records.js";
 import type { ConnectionRecord, ConnectionStore } from "./types.js";
-
-const connectionSchema = z.object({
-  oauthClientId: z.string().min(1),
-  fhirBaseUrl: z.string().url(),
-  tokenEndpoint: z.string().url(),
-  revocationEndpoint: z.string().url().optional(),
-  accessToken: z.string().min(1),
-  refreshToken: z.string().min(1).optional(),
-  tokenType: z.literal("Bearer"),
-  expiresAt: z.number().int().positive(),
-  scope: z.string(),
-  patientId: z.string().min(1),
-  fhirUser: z.string().optional(),
-  connectedAt: z.number().int().positive(),
-  sessionExpiresAt: z.number().int().positive(),
-});
 
 const payloadSchema = z.object({
   version: z.literal(1),
-  connections: z.record(z.string(), connectionSchema),
+  connections: z.record(z.string(), connectionRecordSchema),
 });
 
 const envelopeSchema = z.object({
@@ -53,6 +38,7 @@ const lockSchema = z.object({
 const additionalAuthenticatedData = Buffer.from("epic-mychart-token-store:v1", "utf8");
 
 export class InMemoryConnectionStore implements ConnectionStore {
+  public readonly durable = false;
   readonly #connections = new Map<string, ConnectionRecord>();
 
   public async initialize(): Promise<void> {}
@@ -79,6 +65,7 @@ export class InMemoryConnectionStore implements ConnectionStore {
 }
 
 export class EncryptedFileConnectionStore implements ConnectionStore {
+  public readonly durable = true;
   readonly #connections = new Map<string, ConnectionRecord>();
   #initialized = false;
   #lockHandle: FileHandle | undefined;

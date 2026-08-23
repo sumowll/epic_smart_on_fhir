@@ -10,7 +10,7 @@ The connector implements:
 - Server-side code exchange and signed ID-token validation
 - Epic `client_secret_basic`, `private_key_jwt`, and public-client token authentication
 - Automatic refresh-token use with concurrent-refresh locking
-- Memory-only tokens by default, with optional AES-256-GCM encrypted persistence
+- Memory-only tokens by default, with AES-256-GCM encrypted file or Cloudflare Durable Object persistence
 - Read-only Patient access and an allowlisted, patient-constrained FHIR proxy
 - Best-effort remote token revocation and immediate local disconnect
 - A small browser UI and JSON API
@@ -23,11 +23,14 @@ Create an app in [Epic on FHIR](https://fhir.epic.com/Developer/Apps) and config
 
 1. Set the primary user type to **Patients**.
 2. Select **Incoming API**, **Use OAuth 2.0**, and **R4**.
-3. Register this exact non-production callback:
+3. Register the exact callback for the environment you will run:
 
    ```text
    http://localhost:3000/auth/callback
    ```
+
+   For Cloudflare, use the final Worker or custom-domain URL instead, for example
+   `https://epic-smart-on-fhir.<your-subdomain>.workers.dev/auth/callback`.
 
 4. Select only the FHIR APIs the application needs. Start with `Patient.Read (R4)` and `RelatedPerson.Read (R4)` for patient/proxy identity, then add the specific read/search APIs you intend to call. The local explorer's default resource allowlist is in `.env.example`.
 5. For the easiest local confidential-client setup, generate a sandbox client secret and choose `client_secret_basic`. Epic recommends `private_key_jwt` for production deployments.
@@ -38,10 +41,10 @@ Use only Epic's synthetic [sandbox test patients](https://fhir.epic.com/Document
 
 ## 2. Configure the connector
 
-Node.js 20.19 or newer is required.
+Node.js 22 or newer is required. The checked-in `.node-version` selects Node 22,
+which is available in Cloudflare Workers Builds.
 
 ```bash
-cd epic
 npm install
 cp .env.example .env
 ```
@@ -49,11 +52,21 @@ cp .env.example .env
 Edit `.env` and set at least:
 
 ```dotenv
+APP_LEGAL_NAME=replace-with-your-legal-entity-name
+APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
+APP_LEGAL_EFFECTIVE_DATE=2026-08-23
+APP_HOSTING_PROVIDER_NAME=replace-with-your-hosting-provider-name
 EPIC_CLIENT_ID=your-non-production-client-id
 EPIC_CLIENT_SECRET=your-sandbox-client-secret
 EPIC_TOKEN_AUTH_METHOD=client_secret_basic
 SESSION_SECRET=a-long-random-value
 ```
+
+If you already have `.env`, do not replace it; add these four `APP_*` values to the
+existing file and replace every placeholder with the real operator and deployment
+details. The application refuses to publish the legal pages with the checked-in
+placeholder name, email, or hosting provider, and it requires an explicit effective
+date.
 
 Generate the cookie-signing secret with:
 
@@ -81,6 +94,111 @@ Open [http://localhost:3000](http://localhost:3000), choose **Connect MyChart**,
 The discovery check is read-only. It confirms the configured SMART authorization/token endpoints, PKCE support, supported client authentication methods, and OpenID issuer/JWKS location without accessing a patient account.
 
 The connector intentionally targets current R4 SMART/OIDC discovery. A healthcare organization that exposes only legacy Epic metadata endpoints will need an organization-specific compatibility adapter rather than a silent fallback.
+
+## 4. Deploy to Cloudflare Workers
+
+The repository includes a native Worker entry point, Wrangler configuration, and a
+SQLite-backed Durable Object. Static pages and health checks are served at the Worker
+edge; each signed browser session is routed to its own Durable Object so OAuth state,
+token refresh locking, and disconnects remain strongly ordered without making one
+global object a traffic bottleneck. Pending authorization records and connection
+records are encrypted with AES-256-GCM before they are written to Durable Object
+storage.
+
+In the Cloudflare Git setup screen use:
+
+```text
+Root directory:  leave blank
+Build command:   npm run build
+Deploy command:  npm run deploy
+```
+
+The GitHub repository itself is the project root; do not set the root directory to
+`epic`. Wrangler bundles `src/worker.ts` and provisions the SQLite Durable Object on
+the first deploy.
+
+After the initial deploy, open **Workers & Pages → epic-smart-on-fhir → Settings →
+Variables & Secrets**. These must be runtime values, not Workers Builds variables.
+The first deployment only provisions the Worker and Durable Object; application
+requests will fail configuration validation until these values are added and the
+settings version is deployed.
+
+Add these as ordinary variables:
+
+```dotenv
+APP_LEGAL_NAME=replace-with-your-legal-entity-name
+APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
+APP_LEGAL_EFFECTIVE_DATE=2026-08-23
+APP_HOSTING_PROVIDER_NAME=Cloudflare
+EPIC_CLIENT_ID=your-non-production-client-id
+EPIC_TOKEN_AUTH_METHOD=client_secret_basic
+EPIC_FHIR_BASE_URL=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
+EPIC_PROVIDER_NAME=Epic R4 Sandbox
+EPIC_REDIRECT_URI=https://your-final-worker-host/auth/callback
+EPIC_SCOPES=openid fhirUser launch/patient
+EPIC_REQUEST_OFFLINE_ACCESS=false
+EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure
+```
+
+Add these as encrypted secrets:
+
+```text
+EPIC_CLIENT_SECRET
+SESSION_SECRET
+TOKEN_ENCRYPTION_KEY
+```
+
+Generate the two application secrets separately:
+
+```bash
+openssl rand -base64 48  # SESSION_SECRET
+openssl rand -base64 32  # TOKEN_ENCRYPTION_KEY
+```
+
+Register the exact `EPIC_REDIRECT_URI` with Epic. A `workers.dev` hostname and a
+custom domain are different OAuth callbacks, so choose the final hostname before
+requesting production activation. The same deployment exposes the public legal URLs:
+
+```text
+https://your-final-worker-host/terms
+https://your-final-worker-host/privacy
+```
+
+For local Worker development:
+
+```bash
+cp .dev.vars.example .dev.vars
+npm run dev:worker
+```
+
+The example uses `http://localhost:8787/auth/callback`; register that callback in a
+separate non-production Epic configuration before exercising the local Worker flow.
+Run `npm run cf-typegen` after changing Worker bindings.
+
+## Terms and Privacy pages
+
+The Terms and Privacy Notice are rendered once from shared code and served by both
+the Node and Cloudflare adapters at `/terms` and `/privacy`. The home page links both
+notices before the authorization action and requires an affirmative checkbox before
+enabling **Connect MyChart**. This browser-side acknowledgment is not retained as a
+consent record and must not be represented as evidence of consent; add authenticated,
+server-enforced consent/version records if the production product requires them.
+
+The checked-in language describes this connector's current technical behavior, but
+it is a launch template rather than legal approval. Before using real patient data,
+have qualified counsel review the operator identity and contact method, age/proxy
+rules, applicable consumer-health and breach-notification laws, HIPAA role (if any),
+hosting agreements and log retention, deletion procedures, governing law, and any
+warranty or liability language. Keep the notice synchronized with actual data flows;
+policy text cannot substitute for product authentication, access controls, incident
+response, or rate limiting.
+
+Set `APP_HOSTING_PROVIDER_NAME=Cloudflare` for the current Worker deployment. If the
+service later moves to AWS or another platform, change that value and review every
+storage, logging, subprocessors, and retention statement before publishing the new
+notice. The operator must also confirm that the commitments about sale, advertising,
+and data-broker disclosure match its actual business practices—not only this source
+code.
 
 ## Authentication choices
 
@@ -111,11 +229,17 @@ EPIC_TOKEN_AUTH_METHOD=private_key_jwt
 
 The private key stays in `.secrets/`, which is ignored. `keys:generate` refuses to overwrite existing keys unless `--force` is explicitly passed to the script; key rotation must also be coordinated with Epic.
 
+On Cloudflare, store the private PEM as the encrypted `EPIC_PRIVATE_KEY_PEM` runtime
+secret instead of setting `EPIC_PRIVATE_KEY_PATH`. Set `EPIC_PRIVATE_KEY_ALG` and
+`EPIC_PRIVATE_KEY_KID` as ordinary runtime variables.
+
 ### Public client
 
 `EPIC_TOKEN_AUTH_METHOD=none` is supported for an app registered as non-confidential. It still uses PKCE, but it cannot provide ordinary persistent refresh-token access. Do not hide a shared "secret" in a distributed desktop/browser client and treat it as confidential.
 
 ## Token storage
+
+### Local Node server
 
 The default is deliberately ephemeral:
 
@@ -152,12 +276,32 @@ Local sessions and their encrypted records expire after 30 days. The service che
 
 Each durable grant is bound to the Epic client ID and FHIR base URL that created it. Disconnect or run `tokens:purge` with the old configuration before changing providers or client registrations. If configuration is changed first, the connector refuses to send the new client credentials to the old provider, deletes the incompatible grant locally, and requires manual removal of the old app in MyChart.
 
+### Cloudflare Worker
+
+The Worker does not use `TOKEN_STORAGE` or `TOKEN_STORE_FILE`. It always uses a
+per-session SQLite-backed Durable Object, and it requires `TOKEN_ENCRYPTION_KEY` as a
+runtime secret. Session identifiers are hashed before indexing; OAuth state, PKCE
+verifiers, nonces, patient identifiers, and OAuth tokens are stored only in encrypted
+payloads. An hourly Durable Object alarm expires old sessions and attempts the same
+best-effort remote revocation as the Node server. Pending OAuth state is checked after
+10 minutes, and idle objects remove their alarms instead of waking indefinitely.
+
+`npm run tokens:purge` only operates on the local encrypted file. Before rotating a
+Worker encryption key, rotating `SESSION_SECRET`, or deleting Durable Object data,
+disconnect active grants or revoke the application in MyChart. Losing the old
+encryption/signing key makes existing records or their browser sessions intentionally
+unreadable; the expiry alarm remains the fallback cleanup path.
+
 ## Local JSON API
 
-All routes require the signed, HTTP-only browser session cookie. Tokens are never returned to the browser.
+Stateful FHIR routes require the signed, HTTP-only browser session cookie. Public UI,
+health, and disconnected-status routes do not. Tokens are never returned to the
+browser.
 
 | Method | Route | Purpose |
 |---|---|---|
+| `GET` | `/terms` | Public Terms and Conditions shown before authorization |
+| `GET` | `/privacy` | Public Privacy Notice describing health-data handling |
 | `GET` | `/healthz` | Process health |
 | `POST` | `/auth/start` | Begin standalone SMART authorization |
 | `GET` | `/auth/callback` | Exact registered OAuth callback |
@@ -178,17 +322,26 @@ Disconnecting this application does not sign the patient out of MyChart.
 
 ## Security and deployment boundary
 
-This service is safe by default for a single-user local loopback setup:
+The Node service is safe by default for a single-user local loopback setup:
 
 - It binds to `127.0.0.1`.
 - It accepts only the configured FHIR issuer; users cannot submit arbitrary network destinations.
 - Discovery and API fetches reject redirects, use timeouts and response-size limits, and require HTTPS endpoints.
 - OAuth callback parameters are checked for duplicates, state is consumed atomically, and the authorization code is removed from browser history with an immediate redirect.
 - ID tokens are verified for signature, issuer, audience, expiry, age, and nonce.
-- Logs are disabled so authorization codes, tokens, and PHI do not enter access logs.
+- Application logs are disabled so authorization codes, tokens, and PHI do not enter application logs.
 - Responses use `no-store`, no-referrer, restrictive CSP, frame denial, and MIME hardening headers.
 
-Do not expose this local service on a LAN or public interface. Before a hosted or multi-user deployment, add the product's own authenticated user sessions, authorization policy, HTTPS termination, durable multi-user token storage, KMS-backed encryption/key rotation, audit controls that exclude PHI/tokens, provider-directory caching, and environment-specific Epic credential mapping.
+Do not expose the local Node service on a LAN or public interface. The Cloudflare
+adapter adds HTTPS hosting, strongly ordered durable storage, encryption, and expiry,
+but it does not by itself complete a regulated production security program. Before
+using it with real patient data, add the product's authenticated user identity and
+authorization policy, managed key rotation, PHI-safe audit controls, rate limiting,
+provider-directory caching, environment-specific Epic credential mapping, and verify
+that your Cloudflare plan and contract cover the required healthcare compliance
+obligations. Keep Worker observability disabled unless URL/query redaction and log
+retention have been deliberately configured; OAuth callbacks contain short-lived
+authorization codes and state in the query string.
 
 ## Development checks
 
@@ -196,6 +349,7 @@ Do not expose this local service on a LAN or public interface. Before a hosted o
 npm run check
 npm run build
 npm test
+npm run deploy:dry-run
 ```
 
 The tests cover configuration boundaries, RFC 7636 PKCE, one-time/session-bound OAuth state, duplicate callback rejection, client-secret and private-key token authentication, OIDC verification, concurrent refresh, encrypted storage, patient-constrained FHIR calls, security headers, and a complete mocked authorization flow.
@@ -204,6 +358,11 @@ The tests cover configuration boundaries, RFC 7636 PKCE, one-time/session-bound 
 
 - [Epic OAuth 2.0 tutorial and developer guidance](https://fhir.epic.com/Documentation?docId=fhir)
 - [Epic patient-facing FHIR apps](https://fhir.epic.com/Documentation?docId=patientfacingfhirapps)
+- [Epic patient authentication guidance](https://open.epic.com/Tutorial/PatientAuthentication)
+- [FTC guidance for consumer health information](https://www.ftc.gov/business-guidance/resources/collecting-using-or-sharing-consumer-health-information-look-hipaa-ftc-act-health-breach)
+- [HHS resources for health-app developers](https://www.hhs.gov/hipaa/for-professionals/special-topics/health-apps/index.html)
 - [Epic production endpoint directory](https://open.epic.com/MyApps/Endpoints)
 - [SMART App Launch 2.2](https://hl7.org/fhir/smart-app-launch/STU2.2/app-launch.html)
 - [SMART scopes and launch context](https://hl7.org/fhir/smart-app-launch/STU2.2/scopes-and-launch-context.html)
+- [Cloudflare Workers Builds configuration](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)
+- [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/)

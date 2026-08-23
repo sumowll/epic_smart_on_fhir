@@ -28,7 +28,10 @@ function constantTimeEqual(left: string, right: string): boolean {
 }
 
 export class PendingAuthorizationStore {
-  readonly #items = new Map<string, PendingAuthorization>();
+  readonly #items = new Map<
+    string,
+    { readonly authorization: PendingAuthorization; readonly status: "pending" | "processing" }
+  >();
 
   public constructor(
     private readonly ttlMs = 10 * 60 * 1_000,
@@ -37,7 +40,20 @@ export class PendingAuthorizationStore {
 
   public create(state: string, authorization: PendingAuthorization): void {
     this.prune();
-    this.#items.set(hashState(state), authorization);
+    for (const [key, value] of this.#items) {
+      if (!constantTimeEqual(value.authorization.sessionId, authorization.sessionId)) {
+        continue;
+      }
+      if (value.status === "processing") {
+        throw new AppError(
+          409,
+          "authorization_in_progress",
+          "A MyChart authorization is already being completed. Wait a moment before trying again.",
+        );
+      }
+      this.#items.delete(key);
+    }
+    this.#items.set(hashState(state), { authorization, status: "pending" });
   }
 
   public consume(state: string, sessionId: string): PendingAuthorization {
@@ -46,27 +62,33 @@ export class PendingAuthorizationStore {
     }
 
     const key = hashState(state);
-    const authorization = this.#items.get(key);
-    this.#items.delete(key);
-    if (!authorization || this.now() - authorization.createdAt > this.ttlMs) {
+    const item = this.#items.get(key);
+    if (
+      !item ||
+      item.status !== "pending" ||
+      this.now() - item.authorization.createdAt > this.ttlMs
+    ) {
       throw new AppError(400, "invalid_oauth_state", "The OAuth state is invalid or expired.");
     }
-    if (!constantTimeEqual(authorization.sessionId, sessionId)) {
+    if (!constantTimeEqual(item.authorization.sessionId, sessionId)) {
       throw new AppError(400, "oauth_session_mismatch", "This authorization belongs to another browser session.");
     }
-    return authorization;
+    this.#items.set(key, { authorization: item.authorization, status: "processing" });
+    return item.authorization;
   }
 
   public deleteForSession(sessionId: string): void {
     for (const [key, value] of this.#items) {
-      if (constantTimeEqual(value.sessionId, sessionId)) this.#items.delete(key);
+      if (constantTimeEqual(value.authorization.sessionId, sessionId)) {
+        this.#items.delete(key);
+      }
     }
   }
 
   private prune(): void {
     const cutoff = this.now() - this.ttlMs;
     for (const [key, value] of this.#items) {
-      if (value.createdAt < cutoff) this.#items.delete(key);
+      if (value.authorization.createdAt < cutoff) this.#items.delete(key);
     }
   }
 }

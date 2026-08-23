@@ -344,11 +344,14 @@ export class EpicOAuthClient {
     const algorithm = this.config.privateKeyAlgorithm;
     const keyId = this.config.privateKeyId;
     const privateKeyPath = this.config.privateKeyPath;
-    if (!algorithm || !keyId || !privateKeyPath) {
+    const privateKeyPem = this.config.privateKeyPem;
+    if (!algorithm || !keyId || (!privateKeyPath && !privateKeyPem)) {
       throw new AppError(500, "invalid_config", "The private_key_jwt configuration is incomplete.");
     }
 
-    this.#privateKey ??= readFile(privateKeyPath, "utf8").then((pem) => importPKCS8(pem, algorithm));
+    this.#privateKey ??= privateKeyPem
+      ? importPKCS8(privateKeyPem, algorithm)
+      : readFile(privateKeyPath!, "utf8").then((pem) => importPKCS8(pem, algorithm));
     const now = Math.floor(this.now() / 1_000);
     const issuedAt = now - 5;
     return new SignJWT({})

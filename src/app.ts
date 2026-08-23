@@ -1,34 +1,35 @@
 import cookie from "@fastify/cookie";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 
+import { EpicConnectorService, sessionLifetimeMs } from "./connector.js";
 import { AppError, ReconnectRequiredError } from "./errors.js";
-import { EpicFhirClient } from "./fhir.js";
-import { EpicDiscoveryService } from "./discovery.js";
-import {
-  EpicIdTokenVerifier,
-  EpicOAuthClient,
-  EpicTokenManager,
-} from "./oauth.js";
-import {
-  PendingAuthorizationStore,
-  createPkcePair,
-  parseOAuthCallback,
-  randomBase64Url,
-} from "./security.js";
+import { PendingAuthorizationStore, randomBase64Url } from "./security.js";
 import {
   EncryptedFileConnectionStore,
   InMemoryConnectionStore,
 } from "./store.js";
-import type { AppConfig, ConnectionRecord, ConnectionStore, FetchLike } from "./types.js";
-import { browserScript, renderError, renderHome, styles } from "./ui.js";
+import type {
+  AppConfig,
+  ConnectionStore,
+  FetchLike,
+  PendingAuthorizationRepository,
+} from "./types.js";
+import {
+  browserScript,
+  renderError,
+  renderHome,
+  renderPrivacy,
+  renderTerms,
+  styles,
+} from "./ui.js";
 
 export interface AppDependencies {
   readonly fetch?: FetchLike;
   readonly store?: ConnectionStore;
+  readonly pending?: PendingAuthorizationRepository;
   readonly now?: () => number;
+  readonly enablePruneTimer?: boolean;
 }
-
-const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1_000;
 
 function makeStore(config: AppConfig): ConnectionStore {
   if (config.tokenStorage === "memory") return new InMemoryConnectionStore();
@@ -42,11 +43,12 @@ export async function buildApp(
   config: AppConfig,
   dependencies: AppDependencies = {},
 ): Promise<FastifyInstance> {
-  const fetch = dependencies.fetch ?? globalThis.fetch;
-  const now = dependencies.now ?? Date.now;
   const store = dependencies.store ?? makeStore(config);
-  await store.initialize();
-
+  const service = new EpicConnectorService(config, store, {
+    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+    pending: dependencies.pending ?? new PendingAuthorizationStore(10 * 60 * 1_000, dependencies.now),
+    ...(dependencies.now ? { now: dependencies.now } : {}),
+  });
   const app = Fastify({
     logger: false,
     trustProxy: false,
@@ -56,52 +58,38 @@ export async function buildApp(
     },
     bodyLimit: 32 * 1024,
   });
+
   try {
-    return await configureApp(app, config, store, fetch, now);
+    await service.initialize();
+    return await configureApp(
+      app,
+      service,
+      dependencies.enablePruneTimer ?? true,
+    );
   } catch (error) {
     await app.close().catch(() => undefined);
-    await store.close().catch(() => undefined);
+    await service.close().catch(() => undefined);
     throw error;
   }
 }
 
 async function configureApp(
   app: FastifyInstance,
-  config: AppConfig,
-  store: ConnectionStore,
-  fetch: FetchLike,
-  now: () => number,
+  service: EpicConnectorService,
+  enablePruneTimer: boolean,
 ): Promise<FastifyInstance> {
+  const config = service.config;
   await app.register(cookie, { secret: config.sessionSecret, hook: "onRequest" });
 
-  const discovery = new EpicDiscoveryService(config, fetch, now);
-  const oauth = new EpicOAuthClient(config, fetch, now);
-  const idTokenVerifier = new EpicIdTokenVerifier(config, fetch);
-  const tokenManager = new EpicTokenManager(store, oauth, now);
-  const fhir = new EpicFhirClient(config, fetch);
-  const pending = new PendingAuthorizationStore(10 * 60 * 1_000, now);
-
-  let pruning = false;
-  const pruneExpiredConnections = async (): Promise<void> => {
-    if (pruning) return;
-    pruning = true;
-    try {
-      for (const [sessionId, record] of await store.list()) {
-        if (record.sessionExpiresAt > now()) continue;
-        await tokenManager.disconnect(sessionId);
-      }
-    } finally {
-      pruning = false;
-    }
-  };
-  await pruneExpiredConnections();
-  const pruneTimer = setInterval(() => {
-    void pruneExpiredConnections().catch(() => undefined);
-  }, 60 * 60 * 1_000);
-  pruneTimer.unref();
+  const pruneTimer = enablePruneTimer
+    ? setInterval(() => {
+        void service.pruneExpiredConnections().catch(() => undefined);
+      }, 60 * 60 * 1_000)
+    : undefined;
+  pruneTimer?.unref();
   app.addHook("onClose", async () => {
-    clearInterval(pruneTimer);
-    await store.close();
+    if (pruneTimer) clearInterval(pruneTimer);
+    await service.close();
   });
 
   function readSessionId(request: FastifyRequest): string | undefined {
@@ -145,18 +133,6 @@ async function configureApp(
     }
   }
 
-  async function withFhirConnection<T>(
-    sessionId: string,
-    action: (record: ConnectionRecord) => Promise<T>,
-  ): Promise<T> {
-    try {
-      return await action(await tokenManager.getValidConnection(sessionId));
-    } catch (error) {
-      if (error instanceof ReconnectRequiredError) await tokenManager.disconnect(sessionId);
-      throw error;
-    }
-  }
-
   app.addHook("onSend", async (_request, reply, payload) => {
     reply.header("Cache-Control", "no-store");
     reply.header("Pragma", "no-cache");
@@ -178,6 +154,14 @@ async function configureApp(
     return reply.type("text/html; charset=utf-8").send(renderHome(config));
   });
 
+  app.get("/terms", async (_request, reply) => {
+    return reply.type("text/html; charset=utf-8").send(renderTerms(config));
+  });
+
+  app.get("/privacy", async (_request, reply) => {
+    return reply.type("text/html; charset=utf-8").send(renderPrivacy(config));
+  });
+
   app.get("/styles.css", async (_request, reply) => {
     return reply.type("text/css; charset=utf-8").send(styles);
   });
@@ -191,170 +175,43 @@ async function configureApp(
   app.post("/auth/start", async (request, reply) => {
     requireSameOrigin(request);
     const sessionId = getOrCreateSessionId(request, reply);
-    if (await tokenManager.getConnection(sessionId)) {
-      throw new AppError(409, "already_connected", "Disconnect the current MyChart account before connecting again.");
-    }
-    pending.deleteForSession(sessionId);
-    const discovered = await discovery.discover();
-    const state = randomBase64Url(32);
-    const nonce = randomBase64Url(32);
-    const pkce = createPkcePair();
-    pending.create(state, {
-      sessionId,
-      createdAt: now(),
-      codeVerifier: pkce.verifier,
-      nonce,
-      discovery: discovered,
-    });
-    const authorizationUrl = oauth.buildAuthorizationUrl(discovered, {
-      state,
-      nonce,
-      codeChallenge: pkce.challenge,
-    });
+    const authorizationUrl = await service.startAuthorization(sessionId);
     return reply.code(303).header("Location", authorizationUrl).send();
   });
 
   app.get("/auth/callback", async (request, reply) => {
     const sessionId = requireSessionId(request);
-    const callback = parseOAuthCallback(request.raw.url ?? "/auth/callback");
-    const authorization = pending.consume(callback.state, sessionId);
-    if (callback.kind === "error") {
-      throw new AppError(
-        400,
-        "authorization_denied",
-        callback.error === "access_denied"
-          ? "MyChart access was not authorized."
-          : "MyChart returned an authorization error.",
-      );
-    }
-
-    const token = await oauth.exchangeCode(
-      authorization.discovery.smart.tokenEndpoint,
-      callback.code,
-      authorization.codeVerifier,
-      authorization.discovery.smart.revocationEndpoint,
+    const authenticatedSessionId = await service.completeAuthorization(
+      sessionId,
+      request.raw.url ?? "/auth/callback",
     );
-    let authenticatedSessionId: string | undefined;
-    try {
-      if (!token.patient) {
-        throw new AppError(
-          502,
-          "missing_patient_context",
-          "Epic did not return a patient context. Confirm that the Epic app's primary user type is Patients.",
-        );
-      }
-
-      let fhirUser: string | undefined;
-      if (config.scopes.includes("openid")) {
-        const identity = await idTokenVerifier.verify(
-          token.id_token,
-          authorization.discovery,
-          authorization.nonce,
-        );
-        fhirUser = identity.fhirUser;
-      }
-
-      const connection: ConnectionRecord = {
-        oauthClientId: config.clientId,
-        fhirBaseUrl: authorization.discovery.fhirBaseUrl,
-        tokenEndpoint: authorization.discovery.smart.tokenEndpoint,
-        ...(authorization.discovery.smart.revocationEndpoint
-          ? { revocationEndpoint: authorization.discovery.smart.revocationEndpoint }
-          : {}),
-        accessToken: token.access_token,
-        ...(token.refresh_token ? { refreshToken: token.refresh_token } : {}),
-        tokenType: "Bearer",
-        expiresAt: now() + token.expires_in * 1_000,
-        scope: token.scope ?? "",
-        patientId: token.patient,
-        ...(fhirUser ? { fhirUser } : {}),
-        connectedAt: now(),
-        sessionExpiresAt: now() + sessionLifetimeMs,
-      };
-      authenticatedSessionId = randomBase64Url(32);
-      pending.deleteForSession(sessionId);
-      await tokenManager.invalidate(sessionId);
-      await store.set(authenticatedSessionId, connection);
-      setSessionCookie(reply, authenticatedSessionId);
-      return reply.code(303).header("Location", "/").send();
-    } catch (error) {
-      if (authenticatedSessionId) {
-        await tokenManager.invalidate(authenticatedSessionId).catch(() => undefined);
-      }
-      let revoked = false;
-      const revocationEndpoint = authorization.discovery.smart.revocationEndpoint;
-      if (revocationEndpoint) {
-        try {
-          await oauth.revokeTokens(
-            revocationEndpoint,
-            token.access_token,
-            token.refresh_token,
-          );
-          revoked = true;
-        } catch {
-          // The error below tells the patient how to remove the unsaved grant.
-        }
-      }
-      if (!revoked) {
-        throw new AppError(
-          502,
-          "authorization_cleanup_required",
-          "The connection was not saved. Remove this app in MyChart's linked apps/devices settings before trying again.",
-          { cause: error },
-        );
-      }
-      throw error;
-    }
+    setSessionCookie(reply, authenticatedSessionId);
+    return reply.code(303).header("Location", "/").send();
   });
 
   app.get("/api/connection", async (request) => {
-    const sessionId = readSessionId(request);
-    const record = sessionId ? await tokenManager.getConnection(sessionId) : undefined;
-    if (!record) return { connected: false, provider: config.providerName };
-    return {
-      connected: true,
-      provider: config.providerName,
-      fhirBaseUrl: record.fhirBaseUrl,
-      patientId: record.patientId,
-      scope: record.scope.split(/\s+/).filter(Boolean),
-      expiresAt: new Date(record.expiresAt).toISOString(),
-      refreshable: Boolean(record.refreshToken),
-      durable: Boolean(record.refreshToken) && config.tokenStorage === "encrypted-file",
-      connectedAt: new Date(record.connectedAt).toISOString(),
-      localSessionExpiresAt: new Date(record.sessionExpiresAt).toISOString(),
-    };
+    return service.getConnectionSummary(readSessionId(request));
   });
 
   app.get("/api/patient", async (request) => {
-    const sessionId = requireSessionId(request);
-    return withFhirConnection(sessionId, (record) => fhir.readPatient(record));
+    return service.readPatient(requireSessionId(request));
   });
 
   app.get<{ Params: { resourceType: string } }>("/api/fhir/:resourceType", async (request) => {
-    const sessionId = requireSessionId(request);
     const search = new URL(request.raw.url ?? "/", config.publicOrigin).searchParams;
-    return withFhirConnection(sessionId, (record) =>
-      fhir.search(record, request.params.resourceType, search),
+    return service.search(
+      requireSessionId(request),
+      request.params.resourceType,
+      search,
     );
   });
 
   app.post("/api/disconnect", async (request, reply) => {
     requireSameOrigin(request);
     const sessionId = readSessionId(request);
-    if (!sessionId) {
-      return { disconnected: true, remoteRevocation: "not_applicable", manualRevocationRecommended: false };
-    }
-
-    pending.deleteForSession(sessionId);
-    const outcome = await tokenManager.disconnect(sessionId);
-    reply.clearCookie(config.cookieName, { path: "/" });
-
-    return {
-      disconnected: true,
-      remoteRevocation: outcome.remoteRevocation,
-      manualRevocationRecommended:
-        outcome.hadConnection && outcome.remoteRevocation !== "success",
-    };
+    const outcome = await service.disconnect(sessionId);
+    if (sessionId) reply.clearCookie(config.cookieName, { path: "/" });
+    return outcome;
   });
 
   app.setNotFoundHandler(async (request, reply) => {

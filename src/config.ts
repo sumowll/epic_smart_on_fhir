@@ -88,6 +88,19 @@ function parseEncryptionKey(value: string | undefined): Buffer | undefined {
 }
 
 const baseSchema = z.object({
+  APP_LEGAL_NAME: z.string().trim().min(1).max(200),
+  APP_LEGAL_CONTACT_EMAIL: z.string().trim().email().max(320),
+  APP_LEGAL_EFFECTIVE_DATE: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Must use YYYY-MM-DD format.")
+    .refine(
+      (value) => {
+        const parsed = new Date(`${value}T00:00:00.000Z`);
+        return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+      },
+      "Must be a real calendar date.",
+    ),
+  APP_HOSTING_PROVIDER_NAME: z.string().trim().min(1).max(200),
   EPIC_CLIENT_ID: z.string().trim().min(1),
   EPIC_CLIENT_SECRET: z.string().optional(),
   EPIC_TOKEN_AUTH_METHOD: z
@@ -113,11 +126,14 @@ const baseSchema = z.object({
       "AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure",
     ),
   EPIC_PRIVATE_KEY_PATH: z.string().optional(),
+  EPIC_PRIVATE_KEY_PEM: z.string().optional(),
   EPIC_PRIVATE_KEY_ALG: z.enum(["ES384", "RS384"]).optional(),
   EPIC_PRIVATE_KEY_KID: z.string().optional(),
 });
 
-export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
+export function loadConfig(
+  environment: Record<string, string | undefined> = process.env,
+): AppConfig {
   const result = baseSchema.safeParse(environment);
   if (!result.success) {
     const summary = result.error.issues
@@ -127,6 +143,27 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   }
 
   const env = result.data;
+  if (env.APP_LEGAL_NAME === "replace-with-your-legal-entity-name") {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "Replace the example APP_LEGAL_NAME before starting the connector.",
+    );
+  }
+  if (env.APP_LEGAL_CONTACT_EMAIL === "privacy-contact@example.invalid") {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "Replace the example APP_LEGAL_CONTACT_EMAIL before starting the connector.",
+    );
+  }
+  if (env.APP_HOSTING_PROVIDER_NAME === "replace-with-your-hosting-provider-name") {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "Replace the example APP_HOSTING_PROVIDER_NAME before starting the connector.",
+    );
+  }
   if (env.EPIC_CLIENT_ID === "replace-with-your-non-production-client-id") {
     throw new AppError(500, "invalid_config", "Replace the example EPIC_CLIENT_ID before starting the connector.");
   }
@@ -150,16 +187,24 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   }
 
   const privateKeyPath = env.EPIC_PRIVATE_KEY_PATH?.trim();
+  const privateKeyPem = env.EPIC_PRIVATE_KEY_PEM?.trim();
   const privateKeyId = env.EPIC_PRIVATE_KEY_KID?.trim();
   const privateKeyAlgorithm = env.EPIC_PRIVATE_KEY_ALG;
   if (
     tokenAuthMethod === "private_key_jwt" &&
-    (!privateKeyPath || !privateKeyId || !privateKeyAlgorithm)
+    ((!privateKeyPath && !privateKeyPem) || !privateKeyId || !privateKeyAlgorithm)
   ) {
     throw new AppError(
       500,
       "invalid_config",
-      "private_key_jwt requires EPIC_PRIVATE_KEY_PATH, EPIC_PRIVATE_KEY_ALG, and EPIC_PRIVATE_KEY_KID.",
+      "private_key_jwt requires EPIC_PRIVATE_KEY_PEM or EPIC_PRIVATE_KEY_PATH, plus EPIC_PRIVATE_KEY_ALG and EPIC_PRIVATE_KEY_KID.",
+    );
+  }
+  if (privateKeyPath && privateKeyPem) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "Set only one of EPIC_PRIVATE_KEY_PEM and EPIC_PRIVATE_KEY_PATH.",
     );
   }
 
@@ -211,6 +256,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   }
 
   return {
+    legalName: env.APP_LEGAL_NAME,
+    legalContactEmail: env.APP_LEGAL_CONTACT_EMAIL,
+    legalEffectiveDate: env.APP_LEGAL_EFFECTIVE_DATE,
+    hostingProviderName: env.APP_HOSTING_PROVIDER_NAME,
     clientId: env.EPIC_CLIENT_ID,
     ...(clientSecret ? { clientSecret } : {}),
     tokenAuthMethod,
@@ -229,6 +278,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(tokenEncryptionKey ? { tokenEncryptionKey } : {}),
     allowedResourceTypes,
     ...(privateKeyPath ? { privateKeyPath: resolve(privateKeyPath) } : {}),
+    ...(privateKeyPem ? { privateKeyPem } : {}),
     ...(privateKeyAlgorithm ? { privateKeyAlgorithm } : {}),
     ...(privateKeyId ? { privateKeyId } : {}),
     requestTimeoutMs: 10_000,

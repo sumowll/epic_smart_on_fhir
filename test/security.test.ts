@@ -54,7 +54,22 @@ describe("pending OAuth state", () => {
     const state = "a".repeat(43);
     store.create(state, authorization(500));
     expect(() => store.consume(state, "wrong-session")).toThrow(/another browser session/);
+    expect(store.consume(state, "session-a")).toEqual(authorization(500));
     expect(() => store.consume(state, "session-a")).toThrow(/invalid or expired/);
+  });
+
+  it("allows only one authorization to be completed per session", () => {
+    const store = new PendingAuthorizationStore(10_000, () => 1_000);
+    const firstState = "a".repeat(43);
+    const secondState = "b".repeat(43);
+    store.create(firstState, authorization(500));
+    store.consume(firstState, "session-a");
+
+    expect(() => store.create(secondState, authorization(600))).toThrow(
+      /already being completed/,
+    );
+    store.deleteForSession("session-a");
+    expect(() => store.create(secondState, authorization(600))).not.toThrow();
   });
 
   it("rejects expired state", () => {

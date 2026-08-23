@@ -5,6 +5,10 @@ export function validEnvironment(
   overrides: Record<string, string | undefined> = {},
 ): NodeJS.ProcessEnv {
   return {
+    APP_LEGAL_NAME: "Example Connector, Inc.",
+    APP_LEGAL_CONTACT_EMAIL: "privacy@connector.example.test",
+    APP_LEGAL_EFFECTIVE_DATE: "2026-08-23",
+    APP_HOSTING_PROVIDER_NAME: "Example Cloud Host",
     EPIC_CLIENT_ID: "test-client-id",
     EPIC_CLIENT_SECRET: "secret/value",
     EPIC_TOKEN_AUTH_METHOD: "client_secret_basic",

@@ -1,0 +1,16 @@
+# Copy this file to .dev.vars for `npm run dev:worker`.
+APP_LEGAL_NAME=replace-with-your-legal-entity-name
+APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
+APP_LEGAL_EFFECTIVE_DATE=2026-08-23
+APP_HOSTING_PROVIDER_NAME=replace-with-your-hosting-provider-name
+EPIC_CLIENT_ID=replace-with-your-non-production-client-id
+EPIC_CLIENT_SECRET=replace-with-your-sandbox-client-secret
+EPIC_TOKEN_AUTH_METHOD=client_secret_basic
+EPIC_FHIR_BASE_URL=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
+EPIC_PROVIDER_NAME=Epic R4 Sandbox
+EPIC_REDIRECT_URI=http://localhost:8787/auth/callback
+EPIC_SCOPES=openid fhirUser launch/patient
+EPIC_REQUEST_OFFLINE_ACCESS=false
+EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure
+SESSION_SECRET=replace-with-at-least-32-random-characters
+TOKEN_ENCRYPTION_KEY=replace-with-base64-encoding-of-exactly-32-random-bytes

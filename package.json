@@ -5,13 +5,17 @@
   "type": "module",
   "description": "A secure patient-facing Epic MyChart SMART-on-FHIR connector",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "cf-typegen": "wrangler types --include-env=false",
     "check": "tsc -p tsconfig.json --noEmit",
     "check:epic": "node --env-file-if-exists=.env --import tsx src/check-epic.ts",
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run",
     "keys:generate": "node --import tsx src/generate-key.ts",
     "start": "node --env-file-if-exists=.env dist/server.js",
     "test": "vitest run",
@@ -25,9 +29,10 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
-    "@types/node": "^20.19.24",
+    "@types/node": "^22.0.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.8"
+    "vitest": "^4.0.8",
+    "wrangler": "^4.125.0"
   }
 }

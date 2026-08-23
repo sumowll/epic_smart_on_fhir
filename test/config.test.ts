@@ -47,6 +47,45 @@ describe("configuration", () => {
     ).toThrow(/random SESSION_SECRET/);
   });
 
+  it("requires publishable legal-page operator details", () => {
+    expect(() =>
+      loadConfig(validEnvironment({ APP_LEGAL_NAME: undefined })),
+    ).toThrow(/APP_LEGAL_NAME/);
+    expect(() =>
+      loadConfig(validEnvironment({ APP_LEGAL_CONTACT_EMAIL: "not-an-email" })),
+    ).toThrow(/APP_LEGAL_CONTACT_EMAIL/);
+    expect(() =>
+      loadConfig(
+        validEnvironment({
+          APP_LEGAL_NAME: "replace-with-your-legal-entity-name",
+        }),
+      ),
+    ).toThrow(/Replace the example APP_LEGAL_NAME/);
+    expect(() =>
+      loadConfig(
+        validEnvironment({
+          APP_LEGAL_CONTACT_EMAIL: "privacy-contact@example.invalid",
+        }),
+      ),
+    ).toThrow(/Replace the example APP_LEGAL_CONTACT_EMAIL/);
+    expect(() =>
+      loadConfig(validEnvironment({ APP_LEGAL_EFFECTIVE_DATE: "2026-02-30" })),
+    ).toThrow(/real calendar date/);
+    expect(() =>
+      loadConfig(validEnvironment({ APP_LEGAL_EFFECTIVE_DATE: undefined })),
+    ).toThrow(/APP_LEGAL_EFFECTIVE_DATE/);
+    expect(() =>
+      loadConfig(validEnvironment({ APP_HOSTING_PROVIDER_NAME: undefined })),
+    ).toThrow(/APP_HOSTING_PROVIDER_NAME/);
+    expect(() =>
+      loadConfig(
+        validEnvironment({
+          APP_HOSTING_PROVIDER_NAME: "replace-with-your-hosting-provider-name",
+        }),
+      ),
+    ).toThrow(/Replace the example APP_HOSTING_PROVIDER_NAME/);
+  });
+
   it("requires a 32-byte encryption key for persistent storage", () => {
     expect(() =>
       loadConfig(
@@ -68,5 +107,29 @@ describe("configuration", () => {
         }),
       ),
     ).toThrow(/offline_access requires a confidential/);
+  });
+
+  it("accepts an inline private key for Worker private_key_jwt authentication", () => {
+    const config = loadConfig(validEnvironment({
+      EPIC_TOKEN_AUTH_METHOD: "private_key_jwt",
+      EPIC_CLIENT_SECRET: undefined,
+      EPIC_PRIVATE_KEY_PEM: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+      EPIC_PRIVATE_KEY_ALG: "ES384",
+      EPIC_PRIVATE_KEY_KID: "worker-key",
+    }));
+
+    expect(config.privateKeyPem).toContain("BEGIN PRIVATE KEY");
+    expect(config.privateKeyPath).toBeUndefined();
+  });
+
+  it("rejects ambiguous private-key file and inline configuration", () => {
+    expect(() => loadConfig(validEnvironment({
+      EPIC_TOKEN_AUTH_METHOD: "private_key_jwt",
+      EPIC_CLIENT_SECRET: undefined,
+      EPIC_PRIVATE_KEY_PATH: ".secrets/private-key.pem",
+      EPIC_PRIVATE_KEY_PEM: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+      EPIC_PRIVATE_KEY_ALG: "ES384",
+      EPIC_PRIVATE_KEY_KID: "worker-key",
+    }))).toThrow(/only one/);
   });
 });

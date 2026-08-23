@@ -6,6 +6,10 @@ export type TokenAuthMethod =
   | "none";
 
 export interface AppConfig {
+  readonly legalName: string;
+  readonly legalContactEmail: string;
+  readonly legalEffectiveDate: string;
+  readonly hostingProviderName: string;
   readonly clientId: string;
   readonly clientSecret?: string;
   readonly tokenAuthMethod: TokenAuthMethod;
@@ -24,6 +28,7 @@ export interface AppConfig {
   readonly tokenEncryptionKey?: Buffer;
   readonly allowedResourceTypes: ReadonlySet<string>;
   readonly privateKeyPath?: string;
+  readonly privateKeyPem?: string;
   readonly privateKeyAlgorithm?: "ES384" | "RS384";
   readonly privateKeyId?: string;
   readonly requestTimeoutMs: number;
@@ -86,10 +91,20 @@ export interface ConnectionRecord {
 }
 
 export interface ConnectionStore {
+  readonly durable?: boolean;
   initialize(): Promise<void>;
   close(): Promise<void>;
   get(sessionId: string): Promise<ConnectionRecord | undefined>;
   list(): Promise<ReadonlyArray<readonly [string, ConnectionRecord]>>;
   set(sessionId: string, record: ConnectionRecord): Promise<void>;
   delete(sessionId: string): Promise<void>;
+}
+
+export interface PendingAuthorizationRepository {
+  create(state: string, authorization: PendingAuthorization): void | Promise<void>;
+  consume(
+    state: string,
+    sessionId: string,
+  ): PendingAuthorization | Promise<PendingAuthorization>;
+  deleteForSession(sessionId: string): void | Promise<void>;
 }

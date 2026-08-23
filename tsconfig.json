@@ -17,5 +17,5 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "worker-configuration.d.ts"]
 }

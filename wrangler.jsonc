@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "epic-smart-on-fhir",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-08-22",
+  "keep_vars": true,
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EPIC_CONNECTOR",
+        "class_name": "EpicConnector"
+      }
+    ]
+  },
+  "exports": {
+    "EpicConnector": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

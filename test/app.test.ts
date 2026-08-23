@@ -22,6 +22,27 @@ describe("HTTP application", () => {
     expect(response.headers["content-security-policy"]).toContain("default-src 'none'");
   });
 
+  it("serves public Terms and Privacy pages", async () => {
+    const app = await buildApp(makeConfig());
+    openApps.push(app);
+
+    const terms = await app.inject({ method: "GET", url: "/terms" });
+    expect(terms.statusCode).toBe(200);
+    expect(terms.headers["content-type"]).toContain("text/html");
+    expect(terms.headers["cache-control"]).toBe("no-store");
+    expect(terms.body).toContain("Terms and Conditions");
+    expect(terms.body).toContain("Example Connector, Inc.");
+
+    const privacy = await app.inject({ method: "GET", url: "/privacy" });
+    expect(privacy.statusCode).toBe(200);
+    expect(privacy.body).toContain("Privacy Notice");
+    expect(privacy.body).toContain("privacy@connector.example.test");
+
+    const head = await app.inject({ method: "HEAD", url: "/privacy" });
+    expect(head.statusCode).toBe(200);
+    expect(head.body).toBe("");
+  });
+
   it("rejects cross-origin authorization starts", async () => {
     const app = await buildApp(makeConfig());
     openApps.push(app);
