@@ -94,13 +94,13 @@ function expiredSessionCookie(config: AppConfig): string {
 export function applySecurityHeaders(headers: Headers, config: AppConfig): void {
   headers.set("Cache-Control", "no-store");
   headers.set("Pragma", "no-cache");
-  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("Referrer-Policy", "same-origin");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
   headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self' https://fhir.epic.com; base-uri 'none'; frame-ancestors 'none'",
   );
   if (config.cookieSecure) {
     headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");

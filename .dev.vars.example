@@ -1,4 +1,4 @@
-# Copy this file to .dev.vars for `npm run dev:worker`.
+# Copy this file to .dev.vars for `pnpm run dev:worker`.
 APP_LEGAL_NAME=replace-with-your-legal-entity-name
 APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
 APP_LEGAL_EFFECTIVE_DATE=2026-08-23

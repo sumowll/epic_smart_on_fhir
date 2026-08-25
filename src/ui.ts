@@ -52,6 +52,11 @@ export function renderHome(config: AppConfig): string {
           </div>
           <button id="patient" class="secondary" type="button">Load patient</button>
         </div>
+        <details id="granted-access" class="granted-access" hidden>
+          <summary>Access granted by Epic <span id="granted-scope-count"></span></summary>
+          <p id="scope-warning" class="scope-warning" hidden></p>
+          <code id="granted-scopes"></code>
+        </details>
         <form id="search-form" class="search-row">
           <label for="resource-type">Resource</label>
           <select id="resource-type">${resourceOptions}</select>
@@ -270,6 +275,10 @@ button:hover, .button:hover { background: #065e57; }
 label { font-size: .86rem; font-weight: 750; color: #49636b; }
 select, input { width: 100%; border: 1px solid #c8d7db; border-radius: 9px; background: white; padding: 10px; font: inherit; color: #15313a; }
 .hint { color: #5d747b; font-size: .9rem; line-height: 1.5; }
+.granted-access { margin: 12px 0 16px; color: #49636b; font-size: .86rem; }
+.granted-access summary { cursor: pointer; font-weight: 750; }
+.granted-access code { display: block; margin-top: 10px; color: #36545d; line-height: 1.55; overflow-wrap: anywhere; }
+.scope-warning { margin: 10px 0 0; padding: 10px 12px; border-radius: 9px; background: #fff1c9; color: #704d08; line-height: 1.5; }
 pre { min-height: 240px; max-height: 620px; overflow: auto; border-radius: 12px; background: #0f2931; color: #d9f1ec; padding: 18px; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .note p { margin-bottom: 0; color: #526c74; line-height: 1.65; }
 .legal-notice { max-width: 760px; margin: 18px 0; padding: 14px 16px; border-left: 4px solid #08786e; border-radius: 8px; background: #f0f8f6; color: #36545d; line-height: 1.55; }
@@ -311,6 +320,10 @@ const explorer = document.querySelector('#explorer');
 const result = document.querySelector('#result');
 const patientButton = document.querySelector('#patient');
 const searchForm = document.querySelector('#search-form');
+const grantedAccess = document.querySelector('#granted-access');
+const grantedScopeCount = document.querySelector('#granted-scope-count');
+const grantedScopes = document.querySelector('#granted-scopes');
+const scopeWarning = document.querySelector('#scope-warning');
 
 async function api(path, options) {
   const response = await fetch(path, {
@@ -319,13 +332,60 @@ async function api(path, options) {
     ...options,
   });
   const body = await response.json().catch(() => ({ error: { message: 'Invalid server response.' } }));
-  if (!response.ok) throw new Error(body.error && body.error.message ? body.error.message : 'Request failed.');
+  if (!response.ok) {
+    const apiError = body && body.error && typeof body.error === 'object' ? body.error : {};
+    const error = new Error(typeof apiError.message === 'string' ? apiError.message : 'Request failed.');
+    error.code = typeof apiError.code === 'string' ? apiError.code : 'request_failed';
+    error.status = response.status;
+    throw error;
+  }
   return body;
 }
 
 function showResult(value) {
   result.textContent = JSON.stringify(value, null, 2);
   result.focus();
+}
+
+function showApiError(error) {
+  showResult({
+    error: {
+      code: typeof error.code === 'string' ? error.code : 'request_failed',
+      status: Number.isInteger(error.status) ? error.status : undefined,
+      message: error instanceof Error ? error.message : 'Request failed.',
+    },
+  });
+}
+
+function isFhirResourceScope(scope) {
+  const smart = /^(?:patient|user)\\/(?:\\*|[A-Z][A-Za-z0-9]*)\\.([^?\\s]+)(?:\\?[^\\s]+)?$/.exec(scope);
+  if (smart) {
+    const permission = smart[1].toLowerCase();
+    return permission === 'read' ||
+      permission === 'write' ||
+      permission === '*' ||
+      /^(?!$)c?r?u?d?s?$/.test(permission);
+  }
+
+  const legacy = /^([A-Z][A-Za-z0-9]*)\\.([A-Za-z]+)$/.exec(scope);
+  return legacy !== null && /^(?:read|search|write|create|update|delete)$/i.test(legacy[2]);
+}
+
+function showGrantedAccess(connection) {
+  const scopes = Array.isArray(connection.scope)
+    ? connection.scope.filter((scope) => typeof scope === 'string')
+    : [];
+  const resourceScopes = scopes.filter(isFhirResourceScope);
+  grantedAccess.hidden = false;
+  grantedScopeCount.textContent = '(' + resourceScopes.length + ' FHIR resource scope' + (resourceScopes.length === 1 ? '' : 's') + ')';
+  grantedScopes.textContent = scopes.length ? scopes.join(' ') : 'Epic returned no scope value.';
+  if (resourceScopes.length === 0) {
+    scopeWarning.textContent = 'Epic returned no FHIR resource permissions in this grant. If you changed the app’s Incoming APIs, wait for Epic to synchronize the app record, then disconnect and reconnect.';
+    scopeWarning.hidden = false;
+    grantedAccess.open = true;
+  } else {
+    scopeWarning.hidden = true;
+  }
 }
 
 async function refreshStatus() {
@@ -343,6 +403,7 @@ async function refreshStatus() {
       legalConsent.hidden = true;
       disconnectButton.hidden = false;
       explorer.hidden = false;
+      showGrantedAccess(connection);
     } else {
       statusElement.textContent = 'Not connected';
       statusElement.className = 'status';
@@ -350,6 +411,7 @@ async function refreshStatus() {
       legalConsent.hidden = false;
       disconnectButton.hidden = true;
       explorer.hidden = true;
+      grantedAccess.hidden = true;
     }
   } catch (error) {
     statusElement.textContent = error.message;
@@ -366,7 +428,7 @@ legalConsentCheckbox.addEventListener('change', () => {
 patientButton.addEventListener('click', async () => {
   result.textContent = 'Loading…';
   try { showResult(await api('/api/patient')); }
-  catch (error) { showResult({ error: error.message }); await refreshStatus(); }
+  catch (error) { showApiError(error); await refreshStatus(); }
 });
 
 searchForm.addEventListener('submit', async (event) => {
@@ -375,7 +437,7 @@ searchForm.addEventListener('submit', async (event) => {
   const resourceType = document.querySelector('#resource-type').value;
   const count = document.querySelector('#count').value;
   try { showResult(await api('/api/fhir/' + encodeURIComponent(resourceType) + '?_count=' + encodeURIComponent(count))); }
-  catch (error) { showResult({ error: error.message }); await refreshStatus(); }
+  catch (error) { showApiError(error); await refreshStatus(); }
 });
 
 disconnectButton.addEventListener('click', async () => {

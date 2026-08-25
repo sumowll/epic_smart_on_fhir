@@ -35,17 +35,17 @@ Create an app in [Epic on FHIR](https://fhir.epic.com/Developer/Apps) and config
 4. Select only the FHIR APIs the application needs. Start with `Patient.Read (R4)` and `RelatedPerson.Read (R4)` for patient/proxy identity, then add the specific read/search APIs you intend to call. The local explorer's default resource allowlist is in `.env.example`.
 5. For the easiest local confidential-client setup, generate a sandbox client secret and choose `client_secret_basic`. Epic recommends `private_key_jwt` for production deployments.
 6. Enable **Requires Persistent Access** only if the application genuinely needs access beyond the initial token lifetime.
-7. Save the non-production client ID. Epic notes that sandbox app changes can take roughly 30 minutes to synchronize.
+7. Save the non-production client ID. Epic notes that sandbox app changes can take up to one hour to synchronize.
 
 Use only Epic's synthetic [sandbox test patients](https://fhir.epic.com/Documentation?docId=testpatients) against the sandbox. A real MyChart account cannot be connected to the sandbox.
 
 ## 2. Configure the connector
 
-Node.js 22 or newer is required. The checked-in `.node-version` selects Node 22,
+Node.js 22.13 or newer is required. The checked-in `.node-version` selects Node 22,
 which is available in Cloudflare Workers Builds.
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env
 ```
 
@@ -85,8 +85,8 @@ For a real healthcare organization, choose its R4 base from Epic's [production e
 ## 3. Verify discovery and run
 
 ```bash
-npm run check:epic
-npm run dev
+pnpm run check:epic
+pnpm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000), choose **Connect MyChart**, and complete sign-in and authorization only on the Epic/MyChart page.
@@ -109,9 +109,14 @@ In the Cloudflare Git setup screen use:
 
 ```text
 Root directory:  leave blank
-Build command:   npm run build
-Deploy command:  npm run deploy
+Build command:   pnpm run build
+Deploy command:  pnpm run deploy
+Non-production branch deploy command:  pnpm exec wrangler versions upload
 ```
+
+Under **Settings → Build → Build Variables and Secrets**, set
+`PNPM_VERSION=11.22.0` so Workers Builds uses the pnpm version pinned in
+`package.json` rather than the build image's default version.
 
 The GitHub repository itself is the project root; do not set the root directory to
 `epic`. Wrangler bundles `src/worker.ts` and provisions the SQLite Durable Object on
@@ -139,6 +144,12 @@ EPIC_SCOPES=openid fhirUser launch/patient
 EPIC_REQUEST_OFFLINE_ACCESS=false
 EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure
 ```
+
+For Epic patient-facing apps, Epic derives the granted FHIR resource scopes from the
+Incoming APIs on the app record in addition to the scopes in the authorize request.
+The connector saves and displays the literal scopes returned with the access token;
+those returned scopes, rather than the app page or `EPIC_SCOPES` alone, describe the
+current grant.
 
 Add these as encrypted secrets:
 
@@ -168,12 +179,12 @@ For local Worker development:
 
 ```bash
 cp .dev.vars.example .dev.vars
-npm run dev:worker
+pnpm run dev:worker
 ```
 
 The example uses `http://localhost:8787/auth/callback`; register that callback in a
 separate non-production Epic configuration before exercising the local Worker flow.
-Run `npm run cf-typegen` after changing Worker bindings.
+Run `pnpm run cf-typegen` after changing Worker bindings.
 
 ## Terms and Privacy pages
 
@@ -218,7 +229,7 @@ Epic credentials must be unique per healthcare organization and environment. Do 
 The service also supports Epic's recommended `private_key_jwt` profile with ES384 or RS384. Generate a P-384 pair:
 
 ```bash
-npm run keys:generate
+pnpm run keys:generate
 ```
 
 Host `.secrets/public.jwks.json` at a stable public HTTPS URL and register that JWK Set URL on the Epic app/installation. Then set the `EPIC_PRIVATE_KEY_*` values printed by the command and use:
@@ -265,7 +276,7 @@ The entire token record, including the patient identifier, is encrypted with AES
 The encrypted file is keyed by the signed browser session. If that cookie is lost, rotate the signing secret, or retire the connector, purge all durable tokens with:
 
 ```bash
-npm run tokens:purge
+pnpm run tokens:purge
 ```
 
 Stop the connector before running this command. An exclusive lock prevents the server and purge command from opening the same encrypted store concurrently. The command attempts remote revocation when Epic advertises it, deletes every local encrypted record regardless, and reports when manual revocation in MyChart is still recommended.
@@ -286,7 +297,7 @@ payloads. An hourly Durable Object alarm expires old sessions and attempts the s
 best-effort remote revocation as the Node server. Pending OAuth state is checked after
 10 minutes, and idle objects remove their alarms instead of waking indefinitely.
 
-`npm run tokens:purge` only operates on the local encrypted file. Before rotating a
+`pnpm run tokens:purge` only operates on the local encrypted file. Before rotating a
 Worker encryption key, rotating `SESSION_SECRET`, or deleting Durable Object data,
 disconnect active grants or revoke the application in MyChart. Losing the old
 encryption/signing key makes existing records or their browser sessions intentionally
@@ -313,6 +324,32 @@ browser.
 Search forwarding is intentionally narrow. Supported parameters are `_count`, `_sort`, `authoredon`, `category`, `class`, `clinical-status`, `code`, `date`, `docstatus`, `status`, and `type`. The caller cannot override the patient constraint, request `_include`, perform generic direct reads, or access resource types outside `EPIC_ALLOWED_RESOURCE_TYPES`.
 
 The generic proxy exposes the first FHIR Bundle page only. Add carefully validated same-FHIR-base pagination in an application-specific layer if needed; never send the bearer token to arbitrary Bundle links or FHIR references.
+
+## Troubleshooting Epic 403 responses
+
+The resource dropdown performs FHIR **search** interactions. Each listed resource
+therefore needs its matching `*.Search ... (R4)` Incoming API; adding only its `Read`
+API is not sufficient. The separate **Load patient** action needs `Patient.Read (R4)`.
+
+After adding or changing Incoming APIs:
+
+1. Save the Epic app and mark it ready for the Sandbox when applicable.
+2. Allow up to one hour for the Developer Sandbox to synchronize. Customer-hosted
+   environments can take up to 12 hours and may require the customer to download or
+   update the client record.
+3. Expand **Access granted by Epic** in the explorer, or request
+   `GET /api/connection`, and inspect the current token's returned scopes.
+4. Disconnect the existing connection after the sync window, remove the app under
+   MyChart's linked apps/devices if it remains there, and authorize it again. Refreshing
+   an old grant cannot add permissions.
+5. Confirm the deployed `EPIC_CLIENT_ID` is the non-production ID for the exact app
+   record edited, the primary user type is **Patients**, and the configured FHIR base
+   is the same R4 resource server used for authorization.
+
+The explorer reports `fhir_scope_denied` only when Epic returns an OAuth
+`insufficient_scope` challenge. Other Epic 403 responses use `fhir_access_denied` and
+can reflect patient/user security, context, client distribution, or an unsynchronized
+app record rather than a missing Incoming API.
 
 ## Disconnect and MyChart revocation
 
@@ -346,10 +383,10 @@ authorization codes and state in the query string.
 ## Development checks
 
 ```bash
-npm run check
-npm run build
-npm test
-npm run deploy:dry-run
+pnpm run check
+pnpm run build
+pnpm test
+pnpm run deploy:dry-run
 ```
 
 The tests cover configuration boundaries, RFC 7636 PKCE, one-time/session-bound OAuth state, duplicate callback rejection, client-secret and private-key token authentication, OIDC verification, concurrent refresh, encrypted storage, patient-constrained FHIR calls, security headers, and a complete mocked authorization flow.

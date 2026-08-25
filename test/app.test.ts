@@ -18,7 +18,7 @@ describe("HTTP application", () => {
     const response = await app.inject({ method: "GET", url: "/" });
     expect(response.statusCode).toBe(200);
     expect(response.headers["cache-control"]).toBe("no-store");
-    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+    expect(response.headers["referrer-policy"]).toBe("same-origin");
     expect(response.headers["content-security-policy"]).toContain("default-src 'none'");
   });
 

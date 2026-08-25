@@ -1,4 +1,5 @@
 import cookie from "@fastify/cookie";
+import formbody from "@fastify/formbody";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 
 import { EpicConnectorService, sessionLifetimeMs } from "./connector.js";
@@ -79,7 +80,12 @@ async function configureApp(
   enablePruneTimer: boolean,
 ): Promise<FastifyInstance> {
   const config = service.config;
-  await app.register(cookie, { secret: config.sessionSecret, hook: "onRequest" });
+
+  await app.register(formbody);
+  await app.register(cookie, {
+    secret: config.sessionSecret,
+    hook: "onRequest",
+  });
 
   const pruneTimer = enablePruneTimer
     ? setInterval(() => {
@@ -136,13 +142,13 @@ async function configureApp(
   app.addHook("onSend", async (_request, reply, payload) => {
     reply.header("Cache-Control", "no-store");
     reply.header("Pragma", "no-cache");
-    reply.header("Referrer-Policy", "no-referrer");
+    reply.header("Referrer-Policy", "same-origin");
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("X-Frame-Options", "DENY");
     reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     reply.header(
       "Content-Security-Policy",
-      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self' https://fhir.epic.com; base-uri 'none'; frame-ancestors 'none'",
     );
     if (config.cookieSecure) {
       reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
