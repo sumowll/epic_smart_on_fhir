@@ -28,3 +28,36 @@ export class ReconnectRequiredError extends AppError {
     this.name = "ReconnectRequiredError";
   }
 }
+
+export interface SafeErrorDiagnostic {
+  readonly causeCode?: string;
+  readonly upstreamStatus?: number;
+}
+
+export function safeErrorDiagnostic(error: unknown): SafeErrorDiagnostic {
+  let current: unknown = error;
+  let causeCode: string | undefined;
+  let upstreamStatus: number | undefined;
+  const visited = new Set<unknown>();
+
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    if (depth > 0 && causeCode === undefined && current instanceof AppError) {
+      causeCode = current.code;
+    }
+    if (
+      upstreamStatus === undefined &&
+      current instanceof UpstreamError &&
+      current.upstreamStatus !== undefined
+    ) {
+      upstreamStatus = current.upstreamStatus;
+    }
+    current = current.cause;
+  }
+
+  return {
+    ...(causeCode ? { causeCode } : {}),
+    ...(upstreamStatus !== undefined ? { upstreamStatus } : {}),
+  };
+}

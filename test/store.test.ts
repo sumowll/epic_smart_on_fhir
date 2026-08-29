@@ -17,7 +17,23 @@ const record: ConnectionRecord = {
   expiresAt: 2_000_000_000_000,
   scope: "patient/Patient.read",
   patientId: "sensitive-patient-id",
+  oidcIssuer: "https://ehr.example.test/oauth2",
+  oidcSubject: "sensitive-account-subject",
+  consent: {
+    policyVersion: "terms-2026-08",
+    acceptedAt: 1_700_000_000_000,
+    purpose: "patient-access",
+    requestedScopes: ["openid", "fhirUser", "launch/patient"],
+    allowedResourceScopes: ["patient/Patient.read"],
+  },
+  fhirCapabilities: [{
+    resourceType: "Patient",
+    interactions: ["read", "search"],
+    searchParameters: ["_id"],
+    searchRevIncludes: ["Provenance:target"],
+  }],
   connectedAt: 1_700_000_000_000,
+  lastAccessAt: 1_700_000_000_100,
   sessionExpiresAt: 2_000_000_000_000,
 };
 

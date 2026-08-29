@@ -3,6 +3,11 @@ import { resolve } from "node:path";
 import { z } from "zod";
 
 import { AppError } from "./errors.js";
+import {
+  EPIC_PATIENT_RESOURCE_SCOPES,
+  EPIC_STANDALONE_AUTHORIZATION_SCOPES,
+  parseSmartScopes,
+} from "./smart-scopes.js";
 import type { AppConfig, TokenAuthMethod } from "./types.js";
 
 const truthy = new Set(["1", "true", "yes", "on"]);
@@ -74,17 +79,59 @@ function parseRedirectUri(value: string): URL {
   return url;
 }
 
-function parseEncryptionKey(value: string | undefined): Buffer | undefined {
+function parseEncryptionKey(
+  value: string | undefined,
+  variableName = "TOKEN_ENCRYPTION_KEY",
+): Buffer | undefined {
   if (!value?.trim()) return undefined;
-  const key = Buffer.from(value.trim(), "base64");
-  if (key.length !== 32) {
+  const encoded = value.trim();
+  const key = Buffer.from(encoded, "base64");
+  if (
+    !/^[A-Za-z0-9+/]{43}=$/.test(encoded) ||
+    key.length !== 32 ||
+    key.toString("base64") !== encoded
+  ) {
     throw new AppError(
       500,
       "invalid_config",
-      "TOKEN_ENCRYPTION_KEY must be a base64 encoding of exactly 32 bytes.",
+      `${variableName} must be a base64 encoding of exactly 32 bytes.`,
     );
   }
   return key;
+}
+
+function parseTrustedEndpointOrigins(
+  value: string | undefined,
+  fhirBaseUrl: string,
+): ReadonlySet<string> {
+  const configured = value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? [];
+  const origins = new Set<string>([new URL(fhirBaseUrl).origin]);
+  for (const entry of configured) {
+    let url: URL;
+    try {
+      url = new URL(entry);
+    } catch (error) {
+      throw new AppError(500, "invalid_config", `Invalid trusted Epic endpoint origin: ${entry}`, {
+        cause: error,
+      });
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      (url.pathname !== "/" && url.pathname !== "")
+    ) {
+      throw new AppError(
+        500,
+        "invalid_config",
+        `EPIC_TRUSTED_ENDPOINT_ORIGINS entries must be HTTPS origins: ${entry}`,
+      );
+    }
+    origins.add(url.origin);
+  }
+  return origins;
 }
 
 const baseSchema = z.object({
@@ -113,18 +160,36 @@ const baseSchema = z.object({
   EPIC_REDIRECT_URI: z
     .string()
     .default("http://localhost:3000/auth/callback"),
-  EPIC_SCOPES: z.string().default("openid fhirUser launch/patient"),
+  EPIC_SCOPES: z
+    .string()
+    .max(1_024)
+    .default(EPIC_STANDALONE_AUTHORIZATION_SCOPES.join(" ")),
+  EPIC_ALLOWED_RESOURCE_SCOPES: z
+    .string()
+    .max(16_384)
+    .default(EPIC_PATIENT_RESOURCE_SCOPES.join(" ")),
   SESSION_SECRET: z.string().min(32),
+  CONSENT_POLICY_VERSION: z.string().trim().min(1).max(100).optional(),
+  SESSION_IDLE_TIMEOUT_SECONDS: z.coerce.number().int().min(300).max(86_400).default(1_800),
+  SESSION_MAX_LIFETIME_SECONDS: z.coerce.number().int().min(900).max(86_400).default(28_800),
   HOST: z.string().trim().min(1).default("127.0.0.1"),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   TOKEN_STORAGE: z.enum(["memory", "encrypted-file"]).default("memory"),
   TOKEN_STORE_FILE: z.string().trim().min(1).default(".data/connections.enc"),
   TOKEN_ENCRYPTION_KEY: z.string().optional(),
+  FHIR_HUB_ENABLED: z.string().optional(),
+  FHIR_HUB_STORE_FILE: z.string().trim().min(1).default(".data/fhir-hub.enc"),
+  FHIR_HUB_ENCRYPTION_KEY: z.string().optional(),
+  FHIR_HUB_IDENTITY_KEY: z.string().optional(),
+  FHIR_HUB_CONSENT_VERSION: z.string().trim().min(1).max(100).optional(),
+  FHIR_HUB_RETENTION_DAYS: z.coerce.number().int().min(1).max(3_650).default(365),
   EPIC_ALLOWED_RESOURCE_TYPES: z
     .string()
+    .max(4_096)
     .default(
-      "AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure",
+      "AllergyIntolerance,Binary,CarePlan,CareTeam,Condition,Device,DiagnosticReport,DocumentReference,Encounter,Goal,Immunization,Location,Medication,MedicationRequest,Observation,Organization,Practitioner,PractitionerRole,Procedure,Provenance,RelatedPerson",
     ),
+  EPIC_TRUSTED_ENDPOINT_ORIGINS: z.string().optional(),
   EPIC_PRIVATE_KEY_PATH: z.string().optional(),
   EPIC_PRIVATE_KEY_PEM: z.string().optional(),
   EPIC_PRIVATE_KEY_ALG: z.enum(["ES384", "RS384"]).optional(),
@@ -217,6 +282,51 @@ export function loadConfig(
     );
   }
 
+  const fhirHubEnabled = parseBoolean(env.FHIR_HUB_ENABLED, false);
+  const fhirHubEncryptionKey = parseEncryptionKey(
+    env.FHIR_HUB_ENCRYPTION_KEY,
+    "FHIR_HUB_ENCRYPTION_KEY",
+  );
+  const fhirHubIdentityKey = parseEncryptionKey(
+    env.FHIR_HUB_IDENTITY_KEY,
+    "FHIR_HUB_IDENTITY_KEY",
+  );
+  if (fhirHubEnabled && (!fhirHubEncryptionKey || !fhirHubIdentityKey)) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "FHIR_HUB_ENABLED requires separate 32-byte FHIR_HUB_ENCRYPTION_KEY and FHIR_HUB_IDENTITY_KEY values.",
+    );
+  }
+  if (
+    fhirHubEnabled &&
+    fhirHubEncryptionKey &&
+    fhirHubIdentityKey &&
+    (
+      fhirHubEncryptionKey.equals(fhirHubIdentityKey) ||
+      tokenEncryptionKey?.equals(fhirHubEncryptionKey) === true ||
+      tokenEncryptionKey?.equals(fhirHubIdentityKey) === true ||
+      env.FHIR_HUB_ENCRYPTION_KEY?.trim() === env.SESSION_SECRET ||
+      env.FHIR_HUB_IDENTITY_KEY?.trim() === env.SESSION_SECRET
+    )
+  ) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "FHIR hub encryption, identity, and token-store keys must be distinct.",
+    );
+  }
+  if (
+    fhirHubEnabled &&
+    resolve(env.FHIR_HUB_STORE_FILE) === resolve(env.TOKEN_STORE_FILE)
+  ) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "FHIR_HUB_STORE_FILE must be separate from TOKEN_STORE_FILE.",
+    );
+  }
+
   const redirectUri = parseRedirectUri(env.EPIC_REDIRECT_URI);
   const scopes = env.EPIC_SCOPES.split(/\s+/).filter(Boolean);
   if (parseBoolean(environment.EPIC_REQUEST_OFFLINE_ACCESS, false) && !scopes.includes("offline_access")) {
@@ -225,11 +335,82 @@ export function loadConfig(
   if (scopes.length === 0) {
     throw new AppError(500, "invalid_config", "EPIC_SCOPES must contain at least one scope.");
   }
+  if (
+    scopes.length > 32 ||
+    scopes.some((scope) => scope.length > 256) ||
+    new Set(scopes).size !== scopes.length
+  ) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_SCOPES must contain at most 32 unique, bounded authorization scope values.",
+    );
+  }
+  const resourceScopes = scopes.filter((scope) => /^(?:patient|user|system)\//.test(scope));
+  if (resourceScopes.length > 0) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_SCOPES is serialized into Epic's standalone authorize URL and must not contain FHIR resource scopes. Configure those in EPIC_ALLOWED_RESOURCE_SCOPES.",
+    );
+  }
+
+  const allowedResourceScopes = env.EPIC_ALLOWED_RESOURCE_SCOPES.split(/\s+/).filter(Boolean);
+  if (allowedResourceScopes.length === 0) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_ALLOWED_RESOURCE_SCOPES must contain at least one approved patient resource scope.",
+    );
+  }
+  if (
+    allowedResourceScopes.length > 256 ||
+    allowedResourceScopes.some((scope) => scope.length > 2_048) ||
+    new Set(allowedResourceScopes).size !== allowedResourceScopes.length
+  ) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_ALLOWED_RESOURCE_SCOPES must contain at most 256 unique, bounded scope values.",
+    );
+  }
+  const parsedResourceGrants = parseSmartScopes(allowedResourceScopes);
+  const parsedSourceScopes = new Set(
+    parsedResourceGrants.flatMap((grant) => grant.sourceScopes),
+  );
+  if (
+    allowedResourceScopes.some((scope) => !parsedSourceScopes.has(scope)) ||
+    parsedResourceGrants.some((grant) =>
+      grant.context !== "patient" ||
+      grant.resourceType === "*" ||
+      [...grant.permissions].some((permission) =>
+        permission === "create" || permission === "update" || permission === "delete"))
+  ) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_ALLOWED_RESOURCE_SCOPES may contain only explicit patient-level read/search resource grants.",
+    );
+  }
+  if (env.SESSION_IDLE_TIMEOUT_SECONDS > env.SESSION_MAX_LIFETIME_SECONDS) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "SESSION_IDLE_TIMEOUT_SECONDS cannot exceed SESSION_MAX_LIFETIME_SECONDS.",
+    );
+  }
   if (!scopes.includes("openid")) {
     throw new AppError(
       500,
       "invalid_config",
       "EPIC_SCOPES must include openid so the returned identity can be verified.",
+    );
+  }
+  if (!scopes.includes("launch/patient")) {
+    throw new AppError(
+      500,
+      "invalid_config",
+      "EPIC_SCOPES must include launch/patient so Epic returns the authorized patient context.",
     );
   }
   if (tokenAuthMethod === "none" && scopes.includes("offline_access")) {
@@ -255,6 +436,7 @@ export function loadConfig(
     }
   }
 
+  const fhirBaseUrl = normalizeFhirBaseUrl(env.EPIC_FHIR_BASE_URL);
   return {
     legalName: env.APP_LEGAL_NAME,
     legalContactEmail: env.APP_LEGAL_CONTACT_EMAIL,
@@ -263,19 +445,29 @@ export function loadConfig(
     clientId: env.EPIC_CLIENT_ID,
     ...(clientSecret ? { clientSecret } : {}),
     tokenAuthMethod,
-    fhirBaseUrl: normalizeFhirBaseUrl(env.EPIC_FHIR_BASE_URL),
+    fhirBaseUrl,
     providerName: env.EPIC_PROVIDER_NAME,
     redirectUri: redirectUri.toString(),
     publicOrigin: redirectUri.origin,
     scopes,
+    allowedResourceScopes,
     sessionSecret: env.SESSION_SECRET,
     host: env.HOST,
     port: env.PORT,
     cookieSecure: redirectUri.protocol === "https:",
     cookieName: redirectUri.protocol === "https:" ? "__Host-epic_session" : "epic_session",
+    consentPolicyVersion: env.CONSENT_POLICY_VERSION ?? env.APP_LEGAL_EFFECTIVE_DATE,
+    sessionIdleTimeoutMs: env.SESSION_IDLE_TIMEOUT_SECONDS * 1_000,
+    sessionMaxLifetimeMs: env.SESSION_MAX_LIFETIME_SECONDS * 1_000,
     tokenStorage: env.TOKEN_STORAGE,
     tokenStoreFile: resolve(env.TOKEN_STORE_FILE),
     ...(tokenEncryptionKey ? { tokenEncryptionKey } : {}),
+    fhirHubEnabled,
+    fhirHubStoreFile: resolve(env.FHIR_HUB_STORE_FILE),
+    ...(fhirHubEncryptionKey ? { fhirHubEncryptionKey } : {}),
+    ...(fhirHubIdentityKey ? { fhirHubIdentityKey } : {}),
+    fhirHubConsentVersion: env.FHIR_HUB_CONSENT_VERSION ?? env.APP_LEGAL_EFFECTIVE_DATE,
+    fhirHubRetentionMs: env.FHIR_HUB_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
     allowedResourceTypes,
     ...(privateKeyPath ? { privateKeyPath: resolve(privateKeyPath) } : {}),
     ...(privateKeyPem ? { privateKeyPem } : {}),
@@ -283,5 +475,9 @@ export function loadConfig(
     ...(privateKeyId ? { privateKeyId } : {}),
     requestTimeoutMs: 10_000,
     maxUpstreamBytes: 5 * 1024 * 1024,
+    trustedEndpointOrigins: parseTrustedEndpointOrigins(
+      env.EPIC_TRUSTED_ENDPOINT_ORIGINS,
+      fhirBaseUrl,
+    ),
   };
 }

@@ -13,7 +13,7 @@ import { dirname } from "node:path";
 import { z } from "zod";
 
 import { AppError } from "./errors.js";
-import { connectionRecordSchema } from "./records.js";
+import { connectionRecordSchema, parseConnectionRecord } from "./records.js";
 import type { ConnectionRecord, ConnectionStore } from "./types.js";
 
 const payloadSchema = z.object({
@@ -56,7 +56,7 @@ export class InMemoryConnectionStore implements ConnectionStore {
   }
 
   public async set(sessionId: string, record: ConnectionRecord): Promise<void> {
-    this.#connections.set(sessionId, record);
+    this.#connections.set(sessionId, parseConnectionRecord(record));
   }
 
   public async delete(sessionId: string): Promise<void> {
@@ -98,22 +98,7 @@ export class EncryptedFileConnectionStore implements ConnectionStore {
         const payload = payloadSchema.parse(JSON.parse(plaintext.toString("utf8")));
         this.#connections.clear();
         for (const [sessionId, value] of Object.entries(payload.connections)) {
-          const record: ConnectionRecord = {
-            oauthClientId: value.oauthClientId,
-            fhirBaseUrl: value.fhirBaseUrl,
-            tokenEndpoint: value.tokenEndpoint,
-            ...(value.revocationEndpoint ? { revocationEndpoint: value.revocationEndpoint } : {}),
-            accessToken: value.accessToken,
-            ...(value.refreshToken ? { refreshToken: value.refreshToken } : {}),
-            tokenType: value.tokenType,
-            expiresAt: value.expiresAt,
-            scope: value.scope,
-            patientId: value.patientId,
-            ...(value.fhirUser ? { fhirUser: value.fhirUser } : {}),
-            connectedAt: value.connectedAt,
-            sessionExpiresAt: value.sessionExpiresAt,
-          };
-          this.#connections.set(sessionId, record);
+          this.#connections.set(sessionId, parseConnectionRecord(value));
         }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -151,7 +136,8 @@ export class EncryptedFileConnectionStore implements ConnectionStore {
 
   public async set(sessionId: string, record: ConnectionRecord): Promise<void> {
     this.requireInitialized();
-    await this.queueMutation(() => this.#connections.set(sessionId, record));
+    const validated = parseConnectionRecord(record);
+    await this.queueMutation(() => this.#connections.set(sessionId, validated));
   }
 
   public async delete(sessionId: string): Promise<void> {

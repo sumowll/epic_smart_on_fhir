@@ -10,7 +10,24 @@ EPIC_FHIR_BASE_URL=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
 EPIC_PROVIDER_NAME=Epic R4 Sandbox
 EPIC_REDIRECT_URI=http://localhost:8787/auth/callback
 EPIC_SCOPES=openid fhirUser launch/patient
+EPIC_ALLOWED_RESOURCE_SCOPES=patient/AllergyIntolerance.r patient/AllergyIntolerance.s patient/Binary.r patient/Binary.s patient/CarePlan.r patient/CarePlan.s patient/CareTeam.r patient/CareTeam.s patient/Condition.r patient/Condition.r?category=http://hl7.org/fhir/us/core/CodeSystem/condition-category|health-concern patient/Condition.r?category=http://terminology.hl7.org/CodeSystem/condition-category|problem-list-item patient/Condition.s patient/Condition.s?category=http://hl7.org/fhir/us/core/CodeSystem/condition-category|health-concern patient/Condition.s?category=http://terminology.hl7.org/CodeSystem/condition-category|problem-list-item patient/Device.r patient/Device.s patient/DiagnosticReport.r patient/DiagnosticReport.s patient/DocumentReference.r patient/DocumentReference.r?category=http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category|clinical-note patient/DocumentReference.s patient/DocumentReference.s?category=http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category|clinical-note patient/Encounter.r patient/Encounter.s patient/Goal.r patient/Goal.s patient/Immunization.r patient/Immunization.s patient/Location.r patient/Location.s patient/Medication.r patient/Medication.s patient/MedicationRequest.r patient/MedicationRequest.s patient/Observation.r?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory patient/Observation.r?category=http://terminology.hl7.org/CodeSystem/observation-category|social-history patient/Observation.r?category=http://terminology.hl7.org/CodeSystem/observation-category|vital-signs patient/Observation.s?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory patient/Observation.s?category=http://terminology.hl7.org/CodeSystem/observation-category|social-history patient/Observation.s?category=http://terminology.hl7.org/CodeSystem/observation-category|vital-signs patient/Organization.r patient/Organization.s patient/Patient.r patient/Patient.s patient/Practitioner.r patient/Practitioner.s patient/PractitionerRole.r patient/PractitionerRole.s patient/Procedure.r patient/Procedure.s patient/Provenance.r patient/RelatedPerson.r patient/RelatedPerson.s
 EPIC_REQUEST_OFFLINE_ACCESS=false
-EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure
+EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Binary,CarePlan,CareTeam,Condition,Device,DiagnosticReport,DocumentReference,Encounter,Goal,Immunization,Location,Medication,MedicationRequest,Observation,Organization,Practitioner,PractitionerRole,Procedure,Provenance,RelatedPerson
+EPIC_TRUSTED_ENDPOINT_ORIGINS=https://fhir.epic.com
 SESSION_SECRET=replace-with-at-least-32-random-characters
+CONSENT_POLICY_VERSION=2026-08-23
+SESSION_IDLE_TIMEOUT_SECONDS=1800
+SESSION_MAX_LIFETIME_SECONDS=28800
 TOKEN_ENCRYPTION_KEY=replace-with-base64-encoding-of-exactly-32-random-bytes
+TOKEN_ENCRYPTION_KEY_ID=2026-rotation-1
+# During rotation, retain prior keys as a JSON object until every live record has expired.
+TOKEN_ENCRYPTION_PREVIOUS_KEYS={}
+
+# Required only when FHIR_HUB_ENABLED=true. Use different random values from
+# TOKEN_ENCRYPTION_KEY and SESSION_SECRET. Bump the consent version for an
+# approved intelligence-purpose change; exact acceptance authorizes backfill.
+FHIR_HUB_ENABLED=false
+FHIR_HUB_ENCRYPTION_KEY=
+FHIR_HUB_IDENTITY_KEY=
+FHIR_HUB_CONSENT_VERSION=2026-08-26
+FHIR_HUB_RETENTION_DAYS=365

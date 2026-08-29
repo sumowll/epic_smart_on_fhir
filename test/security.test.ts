@@ -22,14 +22,25 @@ const discovery: DiscoverySnapshot = {
     jwksUri: "https://ehr.example.test/jwks",
     idTokenAlgorithms: ["ES384"],
   },
+  fhirVersion: "R4",
+  fhirCapabilities: [],
 };
 
-function authorization(createdAt: number, sessionId = "session-a"): PendingAuthorization {
+const sessionId = "s".repeat(43);
+
+function authorization(createdAt: number, authorizationSessionId = sessionId): PendingAuthorization {
   return {
-    sessionId,
+    sessionId: authorizationSessionId,
     createdAt,
     codeVerifier: "v".repeat(64),
     nonce: "n".repeat(43),
+    consent: {
+      policyVersion: "2026-08-23",
+      acceptedAt: createdAt,
+      purpose: "patient-access",
+      requestedScopes: ["openid", "launch/patient"],
+      allowedResourceScopes: ["patient/Patient.r"],
+    },
     discovery,
   };
 }
@@ -54,8 +65,8 @@ describe("pending OAuth state", () => {
     const state = "a".repeat(43);
     store.create(state, authorization(500));
     expect(() => store.consume(state, "wrong-session")).toThrow(/another browser session/);
-    expect(store.consume(state, "session-a")).toEqual(authorization(500));
-    expect(() => store.consume(state, "session-a")).toThrow(/invalid or expired/);
+    expect(store.consume(state, sessionId)).toEqual(authorization(500));
+    expect(() => store.consume(state, sessionId)).toThrow(/invalid or expired/);
   });
 
   it("allows only one authorization to be completed per session", () => {
@@ -63,12 +74,12 @@ describe("pending OAuth state", () => {
     const firstState = "a".repeat(43);
     const secondState = "b".repeat(43);
     store.create(firstState, authorization(500));
-    store.consume(firstState, "session-a");
+    store.consume(firstState, sessionId);
 
     expect(() => store.create(secondState, authorization(600))).toThrow(
       /already being completed/,
     );
-    store.deleteForSession("session-a");
+    store.deleteForSession(sessionId);
     expect(() => store.create(secondState, authorization(600))).not.toThrow();
   });
 
@@ -76,7 +87,7 @@ describe("pending OAuth state", () => {
     const store = new PendingAuthorizationStore(100, () => 1_000);
     const state = "b".repeat(43);
     store.create(state, authorization(899));
-    expect(() => store.consume(state, "session-a")).toThrow(/invalid or expired/);
+    expect(() => store.consume(state, sessionId)).toThrow(/invalid or expired/);
   });
 });
 

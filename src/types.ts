@@ -17,15 +17,29 @@ export interface AppConfig {
   readonly providerName: string;
   readonly redirectUri: string;
   readonly publicOrigin: string;
+  /** Literal scopes serialized into Epic's standalone authorize request. */
   readonly scopes: readonly string[];
+  /** Exact patient resource grants Epic may add from configured Incoming APIs. */
+  readonly allowedResourceScopes: readonly string[];
   readonly sessionSecret: string;
   readonly host: string;
   readonly port: number;
   readonly cookieSecure: boolean;
   readonly cookieName: string;
+  readonly consentPolicyVersion: string;
+  readonly sessionIdleTimeoutMs: number;
+  readonly sessionMaxLifetimeMs: number;
   readonly tokenStorage: "memory" | "encrypted-file";
   readonly tokenStoreFile: string;
   readonly tokenEncryptionKey?: Buffer;
+  /** Enables the separately consented, longitudinal FHIR health-data vault. */
+  readonly fhirHubEnabled: boolean;
+  readonly fhirHubStoreFile: string;
+  readonly fhirHubEncryptionKey?: Buffer;
+  /** Stable HMAC key for opaque account/source/patient references. */
+  readonly fhirHubIdentityKey?: Buffer;
+  readonly fhirHubConsentVersion: string;
+  readonly fhirHubRetentionMs: number;
   readonly allowedResourceTypes: ReadonlySet<string>;
   readonly privateKeyPath?: string;
   readonly privateKeyPem?: string;
@@ -33,6 +47,16 @@ export interface AppConfig {
   readonly privateKeyId?: string;
   readonly requestTimeoutMs: number;
   readonly maxUpstreamBytes: number;
+  readonly trustedEndpointOrigins: ReadonlySet<string>;
+}
+
+export interface ConsentReceipt {
+  readonly policyVersion: string;
+  readonly acceptedAt: number;
+  readonly purpose: "patient-access";
+  readonly requestedScopes: readonly string[];
+  /** Optional only so pre-split records can be rejected and removed safely. */
+  readonly allowedResourceScopes?: readonly string[];
 }
 
 export interface SmartConfiguration {
@@ -50,17 +74,34 @@ export interface OidcConfiguration {
   readonly idTokenAlgorithms: readonly string[];
 }
 
+export interface FhirResourceCapability {
+  readonly resourceType: string;
+  readonly interactions: readonly ("read" | "search")[];
+  readonly searchParameters: readonly string[];
+  /** Exact `_revinclude` values advertised for this resource search. */
+  readonly searchRevIncludes?: readonly string[];
+}
+
 export interface DiscoverySnapshot {
   readonly fhirBaseUrl: string;
   readonly smart: SmartConfiguration;
   readonly oidc: OidcConfiguration;
+  readonly fhirVersion: string;
+  readonly fhirCapabilities: readonly FhirResourceCapability[];
 }
 
 export interface PendingAuthorization {
   readonly sessionId: string;
   readonly createdAt: number;
+  /** Optional only for a fail-closed transition from pre-binding pending rows. */
+  readonly oauthClientId?: string;
+  /** Optional only for a fail-closed transition from pre-binding pending rows. */
+  readonly redirectUri?: string;
+  /** Optional only for a fail-closed transition from pre-binding pending rows. */
+  readonly tokenAuthMethod?: TokenAuthMethod;
   readonly codeVerifier: string;
   readonly nonce: string;
+  readonly consent: ConsentReceipt;
   readonly discovery: DiscoverySnapshot;
 }
 
@@ -76,6 +117,8 @@ export interface EpicTokenResponse {
 
 export interface ConnectionRecord {
   readonly oauthClientId: string;
+  /** Optional only so pre-hardening records can be removed safely. */
+  readonly tokenAuthMethod?: TokenAuthMethod;
   readonly fhirBaseUrl: string;
   readonly tokenEndpoint: string;
   readonly revocationEndpoint?: string;
@@ -86,7 +129,14 @@ export interface ConnectionRecord {
   readonly scope: string;
   readonly patientId: string;
   readonly fhirUser?: string;
+  /** Optional only so records written before the production hardening migration can be removed safely. */
+  readonly oidcIssuer?: string;
+  /** Optional only so records written before the production hardening migration can be removed safely. */
+  readonly oidcSubject?: string;
+  readonly consent?: ConsentReceipt;
+  readonly fhirCapabilities?: readonly FhirResourceCapability[];
   readonly connectedAt: number;
+  readonly lastAccessAt?: number;
   readonly sessionExpiresAt: number;
 }
 

@@ -13,6 +13,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { EpicIdTokenVerifier, EpicOAuthClient, EpicTokenManager } from "../src/oauth.js";
+import { EPIC_PATIENT_RESOURCE_SCOPES } from "../src/smart-scopes.js";
 import { InMemoryConnectionStore } from "../src/store.js";
 import type { ConnectionRecord, DiscoverySnapshot, FetchLike } from "../src/types.js";
 import { jsonResponse, makeConfig } from "./helpers.js";
@@ -31,7 +32,47 @@ const discovery: DiscoverySnapshot = {
     jwksUri: "https://ehr.example.test/jwks",
     idTokenAlgorithms: ["ES384"],
   },
+  fhirVersion: "4.0.1",
+  fhirCapabilities: [{
+    resourceType: "Patient",
+    interactions: ["read", "search"],
+    searchParameters: ["_id"],
+  }],
 };
+
+const productionConnectionFields = {
+  tokenAuthMethod: "client_secret_basic" as const,
+  oidcIssuer: discovery.oidc.issuer,
+  oidcSubject: "patient-user-1",
+  consent: {
+    policyVersion: "2026-08-23",
+    acceptedAt: 100,
+    purpose: "patient-access" as const,
+    requestedScopes: ["openid", "fhirUser", "launch/patient"],
+    allowedResourceScopes: [...EPIC_PATIENT_RESOURCE_SCOPES],
+  },
+  fhirCapabilities: discovery.fhirCapabilities,
+  lastAccessAt: 100,
+};
+
+function productionConnection(
+  overrides: Partial<ConnectionRecord> = {},
+): ConnectionRecord {
+  return {
+    ...productionConnectionFields,
+    oauthClientId: "test-client-id",
+    fhirBaseUrl: discovery.fhirBaseUrl,
+    tokenEndpoint: discovery.smart.tokenEndpoint,
+    accessToken: "access-token",
+    tokenType: "Bearer",
+    expiresAt: 100_000,
+    scope: "patient/Patient.r",
+    patientId: "patient-1",
+    connectedAt: 100,
+    sessionExpiresAt: 100_000,
+    ...overrides,
+  };
+}
 
 describe("Epic OAuth client", () => {
   it("builds a standalone authorization request with aud, nonce, state, and PKCE", () => {
@@ -55,6 +96,25 @@ describe("Epic OAuth client", () => {
       code_challenge: "challenge-value",
       code_challenge_method: "S256",
     });
+    expect(url.searchParams.get("scope")?.split(/\s+/)).toHaveLength(3);
+    expect(url.search).not.toContain("patient%2F");
+    expect(url.search.length).toBeLessThan(1_800);
+  });
+
+  it("fails before redirect when a custom standalone query would exceed Epic's safe bound", () => {
+    const customScopes = Array.from(
+      { length: 3 },
+      (_, index) => `custom-${index}:${"|".repeat(220)}`,
+    );
+    const oauth = new EpicOAuthClient(makeConfig({
+      EPIC_SCOPES: ["openid", "fhirUser", "launch/patient", ...customScopes].join(" "),
+    }));
+
+    expect(() => oauth.buildAuthorizationUrl(discovery, {
+      state: "state-value",
+      nonce: "nonce-value",
+      codeChallenge: "challenge-value",
+    })).toThrow(/too large for Epic/);
   });
 
   it("uses Epic's documented URL-encoded client_secret_basic credentials", async () => {
@@ -183,17 +243,270 @@ describe("ID token verification", () => {
     );
     const verifier = new EpicIdTokenVerifier(makeConfig(), fetchMock as FetchLike);
     await expect(verifier.verify(idToken, discovery, "expected-nonce")).resolves.toEqual({
+      issuer: discovery.oidc.issuer,
+      subject: "patient-user-1",
       fhirUser: "https://ehr.example.test/api/FHIR/R4/Patient/user-1",
     });
     await expect(verifier.verify(idToken, discovery, "wrong-nonce")).rejects.toThrow(/invalid identity token/);
   });
 });
 
+describe("local OAuth session enforcement", () => {
+  it("treats reordered authorization and resource scope sets as the same policy", async () => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      consent: {
+        ...productionConnectionFields.consent,
+        requestedScopes: [...productionConnectionFields.consent.requestedScopes].reverse(),
+        allowedResourceScopes: [
+          ...productionConnectionFields.consent.allowedResourceScopes,
+        ].reverse(),
+      },
+    }));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).resolves.toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("expires an otherwise-valid connection exactly at the idle boundary", async () => {
+    let now = 1_499;
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      lastAccessAt: 1_000,
+      sessionExpiresAt: 20_000,
+    }));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => now);
+    const manager = new EpicTokenManager(store, oauth, () => now, 500);
+
+    await expect(manager.getConnection("session")).resolves.toBeDefined();
+    now = 1_500;
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/session expired/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("enforces the absolute session lifetime even after recent activity", async () => {
+    const now = 10_000;
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      lastAccessAt: now - 1,
+      sessionExpiresAt: now,
+    }));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => now);
+    const manager = new EpicTokenManager(store, oauth, () => now, 5_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/maximum lifetime/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "oidcIssuer",
+    "oidcSubject",
+    "tokenAuthMethod",
+    "consent",
+    "fhirCapabilities",
+  ] as const)("fails closed when saved production metadata omits %s", async (field) => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    const record = productionConnection();
+    delete (record as unknown as Record<string, unknown>)[field];
+    await store.set("session", record);
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/identity and consent controls/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a saved consent receipt is for an older policy", async () => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      consent: {
+        ...productionConnectionFields.consent,
+        policyVersion: "terms-v1",
+      },
+    }));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000, 10_000, "terms-v2");
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/identity and consent controls/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for a pre-split consent receipt with no resource policy snapshot", async () => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    const legacyConsent = { ...productionConnectionFields.consent };
+    delete (legacyConsent as Partial<typeof legacyConsent>).allowedResourceScopes;
+    await store.set("session", productionConnection({ consent: legacyConsent }));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/different Epic provider/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "authorization scopes changed",
+      overrides: {
+        consent: {
+          ...productionConnectionFields.consent,
+          requestedScopes: [
+            ...productionConnectionFields.consent.requestedScopes,
+            "profile",
+          ],
+        },
+      },
+    },
+    {
+      name: "persisted authorization scopes contain a duplicate",
+      overrides: {
+        consent: {
+          ...productionConnectionFields.consent,
+          requestedScopes: ["openid", "openid", "launch/patient"],
+        },
+      },
+    },
+    {
+      name: "OIDC issuer origin is no longer trusted",
+      overrides: { oidcIssuer: "https://retired-auth.example.test/oauth2" },
+    },
+    {
+      name: "client authentication method changed",
+      overrides: { tokenAuthMethod: "private_key_jwt" as const },
+    },
+  ])("invalidates a saved connection when $name", async ({ overrides }) => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection(overrides));
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/different Epic provider/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not restore a connection when disconnect races an idle-session touch", async () => {
+    const now = 1_000;
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      lastAccessAt: 100,
+      sessionExpiresAt: 100_000,
+    }));
+    const originalSet = store.set.bind(store);
+    let markTouchStarted!: () => void;
+    const touchStarted = new Promise<void>((resolve) => {
+      markTouchStarted = resolve;
+    });
+    let releaseTouch!: () => void;
+    const touchCanFinish = new Promise<void>((resolve) => {
+      releaseTouch = resolve;
+    });
+    vi.spyOn(store, "set").mockImplementationOnce(async (sessionId, record) => {
+      markTouchStarted();
+      await touchCanFinish;
+      await originalSet(sessionId, record);
+    });
+    const fetchMock = vi.fn();
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => now);
+    const manager = new EpicTokenManager(store, oauth, () => now, 1_200);
+
+    const reading = manager.getValidConnection("session");
+    await touchStarted;
+    await manager.disconnect("session");
+    releaseTouch();
+
+    await expect(reading).rejects.toThrow(/disconnected/);
+    expect(await store.get("session")).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("token refresh", () => {
+  it("accepts an approved resource grant when refresh preserves the actual prior scope", async () => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set("session", productionConnection({
+      accessToken: "expired",
+      refreshToken: "refresh-1",
+      expiresAt: 500,
+      scope: "openid fhirUser launch/patient patient/Patient.r",
+    }));
+    const fetchMock = vi.fn(async () => jsonResponse({
+      access_token: "new-access",
+      token_type: "bearer",
+      expires_in: 3600,
+      scope: "openid fhirUser launch/patient patient/Patient.r",
+    }));
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).resolves.toMatchObject({
+      accessToken: "new-access",
+      scope: "openid fhirUser launch/patient patient/Patient.r",
+    });
+  });
+
+  it("revokes and removes a refresh that broadens the actual prior resource grant", async () => {
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    const record = productionConnection({
+      revocationEndpoint: "https://ehr.example.test/revoke",
+      accessToken: "expired",
+      refreshToken: "refresh-1",
+      expiresAt: 500,
+      scope: "openid fhirUser launch/patient patient/Patient.r",
+    });
+    await store.set("session", record);
+    const revoked = new Set<string>();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (input.toString() === discovery.smart.tokenEndpoint) {
+        return jsonResponse({
+          access_token: "broadened-access",
+          token_type: "bearer",
+          expires_in: 3600,
+          scope: "openid fhirUser launch/patient patient/Patient.r patient/Condition.r",
+        });
+      }
+      if (input.toString() === record.revocationEndpoint) {
+        revoked.add(new URLSearchParams(init?.body?.toString()).get("token")!);
+        return jsonResponse({});
+      }
+      throw new Error(`Unexpected fetch: ${input.toString()}`);
+    });
+    const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/connect again/);
+    expect(revoked).toEqual(new Set(["broadened-access", "refresh-1"]));
+    expect(await store.get("session")).toBeUndefined();
+  });
+
   it("collapses concurrent refreshes and preserves an unrotated refresh token", async () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,
@@ -201,7 +514,7 @@ describe("token refresh", () => {
       refreshToken: "refresh-1",
       tokenType: "Bearer",
       expiresAt: 500,
-      scope: "old-scope",
+      scope: "openid",
       patientId: "patient-1",
       connectedAt: 100,
       sessionExpiresAt: 10_000,
@@ -215,7 +528,7 @@ describe("token refresh", () => {
         access_token: "new-access",
         token_type: "bearer",
         expires_in: 3600,
-        scope: "new-scope",
+        scope: "openid",
       });
     });
     const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike, () => 1_000);
@@ -233,6 +546,7 @@ describe("token refresh", () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,
@@ -240,7 +554,7 @@ describe("token refresh", () => {
       refreshToken: "refresh-1",
       tokenType: "Bearer",
       expiresAt: 500,
-      scope: "old-scope",
+      scope: "openid",
       patientId: "patient-1",
       connectedAt: 100,
       sessionExpiresAt: 10_000,
@@ -267,6 +581,7 @@ describe("token refresh", () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,
@@ -275,7 +590,7 @@ describe("token refresh", () => {
       refreshToken: "old-refresh",
       tokenType: "Bearer",
       expiresAt: 500,
-      scope: "old-scope",
+      scope: "openid",
       patientId: "patient-1",
       connectedAt: 100,
       sessionExpiresAt: 10_000,
@@ -325,6 +640,7 @@ describe("token refresh", () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,
@@ -352,6 +668,7 @@ describe("token refresh", () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const mismatched: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "old-client-id",
       fhirBaseUrl: "https://old-ehr.example.test/api/FHIR/R4",
       tokenEndpoint: "https://old-ehr.example.test/token",
@@ -375,10 +692,39 @@ describe("token refresh", () => {
     expect(await store.get("session")).toBeUndefined();
   });
 
+  it("revokes a binding-compatible saved grant when the current scope policy is narrower", async () => {
+    const config = makeConfig();
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    const record = productionConnection({
+      revocationEndpoint: "https://ehr.example.test/revoke",
+      consent: {
+        ...productionConnectionFields.consent,
+        allowedResourceScopes: [
+          ...productionConnectionFields.consent.allowedResourceScopes,
+          "patient/Appointment.r",
+        ],
+      },
+    });
+    await store.set("session", record);
+    const revoked = new Set<string>();
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      revoked.add(new URLSearchParams(init?.body?.toString()).get("token")!);
+      return jsonResponse({});
+    });
+    const oauth = new EpicOAuthClient(config, fetchMock as FetchLike, () => 1_000);
+    const manager = new EpicTokenManager(store, oauth, () => 1_000);
+
+    await expect(manager.getValidConnection("session")).rejects.toThrow(/different Epic provider/);
+    expect(revoked).toEqual(new Set(["access-token"]));
+    expect(await store.get("session")).toBeUndefined();
+  });
+
   it("revokes a refreshed grant when local persistence fails", async () => {
     const store = new InMemoryConnectionStore();
     await store.initialize();
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,
@@ -429,6 +775,7 @@ describe("token revocation", () => {
     });
     const oauth = new EpicOAuthClient(makeConfig(), fetchMock as FetchLike);
     const record: ConnectionRecord = {
+      ...productionConnectionFields,
       oauthClientId: "test-client-id",
       fhirBaseUrl: discovery.fhirBaseUrl,
       tokenEndpoint: discovery.smart.tokenEndpoint,

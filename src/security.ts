@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { AppError } from "./errors.js";
+import { parsePendingAuthorization } from "./records.js";
 import type { PendingAuthorization } from "./types.js";
 
 export function randomBase64Url(bytes = 32): string {
@@ -39,9 +40,10 @@ export class PendingAuthorizationStore {
   ) {}
 
   public create(state: string, authorization: PendingAuthorization): void {
+    const validated = parsePendingAuthorization(authorization);
     this.prune();
     for (const [key, value] of this.#items) {
-      if (!constantTimeEqual(value.authorization.sessionId, authorization.sessionId)) {
+      if (!constantTimeEqual(value.authorization.sessionId, validated.sessionId)) {
         continue;
       }
       if (value.status === "processing") {
@@ -53,7 +55,7 @@ export class PendingAuthorizationStore {
       }
       this.#items.delete(key);
     }
-    this.#items.set(hashState(state), { authorization, status: "pending" });
+    this.#items.set(hashState(state), { authorization: validated, status: "pending" });
   }
 
   public consume(state: string, sessionId: string): PendingAuthorization {

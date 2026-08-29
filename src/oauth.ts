@@ -12,6 +12,10 @@ import { z } from "zod";
 
 import { AppError, ReconnectRequiredError, UpstreamError } from "./errors.js";
 import { requestJson } from "./http.js";
+import {
+  assertGrantedSmartScopesWithinPolicy,
+  assertGrantedSmartScopesWithinRequest,
+} from "./smart-scopes.js";
 import type {
   AppConfig,
   ConnectionRecord,
@@ -22,18 +26,18 @@ import type {
 } from "./types.js";
 
 const tokenSchema = z.object({
-  access_token: z.string().min(1),
+  access_token: z.string().min(1).max(128 * 1024),
   token_type: z.string().min(1),
   expires_in: z.coerce.number().int().positive().max(7 * 24 * 60 * 60),
-  scope: z.string().optional(),
-  refresh_token: z.string().min(1).optional(),
-  id_token: z.string().min(1).optional(),
+  scope: z.string().max(32 * 1024).optional(),
+  refresh_token: z.string().min(1).max(128 * 1024).optional(),
+  id_token: z.string().min(1).max(128 * 1024).optional(),
   patient: z.string().min(1).max(512).optional(),
 });
 
 const issuedTokenFragmentSchema = z.object({
-  access_token: z.string().min(1).optional(),
-  refresh_token: z.string().min(1).optional(),
+  access_token: z.string().min(1).max(128 * 1024).optional(),
+  refresh_token: z.string().min(1).max(128 * 1024).optional(),
 }).refine((value) => value.access_token !== undefined || value.refresh_token !== undefined);
 
 const oauthErrorSchema = z.object({
@@ -69,6 +73,16 @@ export class EpicOAuthClient {
       readonly codeChallenge: string;
     },
   ): string {
+    if (
+      discovery.fhirBaseUrl !== this.config.fhirBaseUrl ||
+      !this.isTrustedEndpoint(discovery.smart.authorizationEndpoint)
+    ) {
+      throw new AppError(
+        409,
+        "authorization_context_changed",
+        "The Epic authorization configuration is no longer trusted. Start again.",
+      );
+    }
     const url = new URL(discovery.smart.authorizationEndpoint);
     url.searchParams.set("response_type", "code");
     url.searchParams.set("client_id", this.config.clientId);
@@ -79,6 +93,13 @@ export class EpicOAuthClient {
     url.searchParams.set("nonce", parameters.nonce);
     url.searchParams.set("code_challenge", parameters.codeChallenge);
     url.searchParams.set("code_challenge_method", "S256");
+    if (url.search.length > 1_800) {
+      throw new AppError(
+        500,
+        "authorization_request_too_large",
+        "The configured standalone authorization request is too large for Epic. Keep FHIR resource scopes in EPIC_ALLOWED_RESOURCE_SCOPES.",
+      );
+    }
     return url.toString();
   }
 
@@ -88,6 +109,16 @@ export class EpicOAuthClient {
     codeVerifier: string,
     revocationEndpoint?: string,
   ): Promise<EpicTokenResponse> {
+    if (
+      !this.isTrustedEndpoint(tokenEndpoint) ||
+      (revocationEndpoint && !this.isTrustedEndpoint(revocationEndpoint))
+    ) {
+      throw new AppError(
+        409,
+        "authorization_context_changed",
+        "The Epic token configuration is no longer trusted. Start again.",
+      );
+    }
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code,
@@ -141,15 +172,63 @@ export class EpicOAuthClient {
   }
 
   public isConnectionCompatible(record: ConnectionRecord): boolean {
+    return this.canSafelyRevoke(record) &&
+      Boolean(record.oidcIssuer && this.isTrustedEndpoint(record.oidcIssuer)) &&
+      Boolean(record.consent && this.sameScopes(
+        record.consent.requestedScopes,
+        this.config.scopes,
+      ) && record.consent.allowedResourceScopes && this.sameScopes(
+        record.consent.allowedResourceScopes,
+        this.config.allowedResourceScopes,
+      ));
+  }
+
+  public canSafelyRevoke(record: ConnectionRecord): boolean {
+    return this.isOAuthBindingCompatible(record) &&
+      record.tokenAuthMethod === this.config.tokenAuthMethod;
+  }
+
+  private isOAuthBindingCompatible(record: ConnectionRecord): boolean {
     return record.oauthClientId === this.config.clientId &&
-      record.fhirBaseUrl === this.config.fhirBaseUrl;
+      record.fhirBaseUrl === this.config.fhirBaseUrl &&
+      this.isTrustedEndpoint(record.tokenEndpoint) &&
+      (!record.revocationEndpoint || this.isTrustedEndpoint(record.revocationEndpoint));
+  }
+
+  private sameScopes(left: readonly string[], right: readonly string[]): boolean {
+    if (left.length !== right.length) return false;
+    const leftScopes = new Set(left);
+    const rightScopes = new Set(right);
+    return leftScopes.size === left.length &&
+      rightScopes.size === right.length &&
+      [...leftScopes].every((scope) => rightScopes.has(scope));
+  }
+
+  private isTrustedEndpoint(value: string): boolean {
+    try {
+      const endpoint = new URL(value);
+      return endpoint.protocol === "https:" &&
+        !endpoint.username &&
+        !endpoint.password &&
+        !endpoint.search &&
+        !endpoint.hash &&
+        this.config.trustedEndpointOrigins.has(endpoint.origin);
+    } catch {
+      return false;
+    }
   }
 
   public async revoke(
     revocationEndpoint: string,
     record: ConnectionRecord,
   ): Promise<void> {
-    this.requireConnectionCompatible(record);
+    if (!this.canSafelyRevoke(record)) {
+      throw new AppError(
+        409,
+        "connection_config_mismatch",
+        "The saved Epic revocation endpoint is no longer bound to this client and provider.",
+      );
+    }
     return this.revokeTokens(
       revocationEndpoint,
       record.accessToken,
@@ -170,6 +249,13 @@ export class EpicOAuthClient {
         ? ([[accessToken, "access_token"]] as const)
         : []),
     ];
+    if (tokens.length > 0 && !this.isTrustedEndpoint(revocationEndpoint)) {
+      throw new AppError(
+        409,
+        "connection_config_mismatch",
+        "The saved Epic revocation endpoint is no longer trusted.",
+      );
+    }
     let firstFailure: unknown;
     for (const [token, hint] of tokens) {
       try {
@@ -377,11 +463,26 @@ export class EpicIdTokenVerifier {
     idToken: string | undefined,
     discovery: DiscoverySnapshot,
     expectedNonce: string,
-  ): Promise<{ readonly fhirUser?: string }> {
+  ): Promise<{
+    readonly issuer: string;
+    readonly subject: string;
+    readonly fhirUser?: string;
+  }> {
     if (!idToken) {
       throw new UpstreamError(
         "missing_id_token",
         "Epic did not return the expected OpenID identity token.",
+      );
+    }
+    if (
+      discovery.fhirBaseUrl !== this.config.fhirBaseUrl ||
+      !this.isTrustedEndpoint(discovery.oidc.issuer) ||
+      !this.isTrustedEndpoint(discovery.oidc.jwksUri)
+    ) {
+      throw new AppError(
+        409,
+        "authorization_context_changed",
+        "The Epic identity configuration is no longer trusted. Start again.",
       );
     }
 
@@ -426,7 +527,11 @@ export class EpicIdTokenVerifier {
         throw new Error("ID token authorized party mismatch");
       }
       const fhirUser = typeof payload.fhirUser === "string" ? payload.fhirUser : undefined;
-      return fhirUser ? { fhirUser } : {};
+      return {
+        issuer: discovery.oidc.issuer,
+        subject: payload.sub,
+        ...(fhirUser ? { fhirUser } : {}),
+      };
     } catch (error) {
       throw new AppError(
         401,
@@ -434,6 +539,20 @@ export class EpicIdTokenVerifier {
         "Epic returned an invalid identity token.",
         { cause: error },
       );
+    }
+  }
+
+  private isTrustedEndpoint(value: string): boolean {
+    try {
+      const endpoint = new URL(value);
+      return endpoint.protocol === "https:" &&
+        !endpoint.username &&
+        !endpoint.password &&
+        !endpoint.search &&
+        !endpoint.hash &&
+        this.config.trustedEndpointOrigins.has(endpoint.origin);
+    } catch {
+      return false;
     }
   }
 }
@@ -450,13 +569,19 @@ export class EpicTokenManager {
     private readonly store: ConnectionStore,
     private readonly oauth: EpicOAuthClient,
     private readonly now: () => number = Date.now,
+    private readonly idleTimeoutMs = 30 * 60 * 1_000,
+    private readonly currentConsentPolicyVersion?: string,
   ) {}
 
   public async getConnection(sessionId: string): Promise<ConnectionRecord | undefined> {
     if (this.#invalidating.has(sessionId)) return undefined;
     const record = await this.store.get(sessionId);
     if (this.#invalidating.has(sessionId)) return undefined;
-    if (record && record.sessionExpiresAt <= this.now()) {
+    if (record && (
+      !this.hasProductionIdentity(record) ||
+      !this.oauth.isConnectionCompatible(record) ||
+      this.isSessionExpired(record)
+    )) {
       await this.expireConnection(sessionId);
       return undefined;
     }
@@ -477,17 +602,31 @@ export class EpicTokenManager {
       throw new ReconnectRequiredError("The MyChart connection is being disconnected.");
     }
     if (!record) throw new ReconnectRequiredError("Connect your MyChart account first.");
+    if (!this.hasProductionIdentity(record)) {
+      await this.disconnect(sessionId);
+      throw new ReconnectRequiredError(
+        "This saved connection predates the current identity and consent controls. Please connect again.",
+      );
+    }
     if (!this.oauth.isConnectionCompatible(record)) {
       await this.disconnect(sessionId);
       throw new ReconnectRequiredError(
         "This saved MyChart grant belongs to a different Epic provider or client registration. It was removed locally; remove the old app in MyChart's linked apps/devices settings.",
       );
     }
-    if (record.sessionExpiresAt <= this.now()) {
+    if (this.isSessionExpired(record)) {
       await this.expireConnection(sessionId);
-      throw new ReconnectRequiredError("The local MyChart session expired. Please connect again.");
+      throw new ReconnectRequiredError(
+        "The local MyChart session expired because of inactivity or its maximum lifetime. Please connect again.",
+      );
     }
-    if (record.expiresAt > this.now() + 60_000) return record;
+    if (record.expiresAt > this.now() + 60_000) {
+      return this.touchConnection(
+        sessionId,
+        record,
+        this.#versions.get(sessionId) ?? 0,
+      );
+    }
     if (!record.refreshToken) {
       await this.disconnect(sessionId);
       throw new ReconnectRequiredError();
@@ -532,7 +671,17 @@ export class EpicTokenManager {
             : {}),
         expiresAt: this.now() + token.expires_in * 1_000,
         scope: token.scope ?? current.scope,
+        lastAccessAt: this.now(),
       };
+      assertGrantedSmartScopesWithinPolicy(
+        refreshed.scope,
+        current.consent?.requestedScopes ?? [],
+        current.consent?.allowedResourceScopes ?? [],
+      );
+      // A refresh may preserve or narrow the actual prior grant, but it must
+      // not silently activate another resource that merely exists in the app's
+      // broader registration policy.
+      assertGrantedSmartScopesWithinRequest(refreshed.scope, current.scope);
       if (
         this.#invalidating.has(sessionId) ||
         (this.#versions.get(sessionId) ?? 0) !== version
@@ -584,6 +733,52 @@ export class EpicTokenManager {
     await this.disconnect(sessionId);
   }
 
+  private hasProductionIdentity(record: ConnectionRecord): boolean {
+    return Boolean(
+      record.oidcIssuer &&
+      record.oidcSubject &&
+      record.tokenAuthMethod &&
+      record.consent &&
+      (!this.currentConsentPolicyVersion ||
+        record.consent.policyVersion === this.currentConsentPolicyVersion) &&
+      record.fhirCapabilities,
+    );
+  }
+
+  private isSessionExpired(record: ConnectionRecord): boolean {
+    const lastAccessAt = record.lastAccessAt ?? record.connectedAt;
+    return (
+      record.sessionExpiresAt <= this.now() ||
+      lastAccessAt + this.idleTimeoutMs <= this.now()
+    );
+  }
+
+  private async touchConnection(
+    sessionId: string,
+    record: ConnectionRecord,
+    version: number,
+  ): Promise<ConnectionRecord> {
+    const lastAccessAt = record.lastAccessAt ?? record.connectedAt;
+    const touchInterval = Math.min(5 * 60 * 1_000, Math.floor(this.idleTimeoutMs / 4));
+    if (this.now() - lastAccessAt < touchInterval) return record;
+    const touched = { ...record, lastAccessAt: this.now() };
+    if (
+      this.#invalidating.has(sessionId) ||
+      (this.#versions.get(sessionId) ?? 0) !== version
+    ) {
+      throw new ReconnectRequiredError("The MyChart connection was disconnected.");
+    }
+    await this.store.set(sessionId, touched);
+    if (
+      this.#invalidating.has(sessionId) ||
+      (this.#versions.get(sessionId) ?? 0) !== version
+    ) {
+      await this.store.delete(sessionId);
+      throw new ReconnectRequiredError("The MyChart connection was disconnected.");
+    }
+    return touched;
+  }
+
   private async performDisconnect(sessionId: string): Promise<TokenDisconnectOutcome> {
     this.#invalidating.add(sessionId);
     this.#versions.set(sessionId, (this.#versions.get(sessionId) ?? 0) + 1);
@@ -613,7 +808,7 @@ export class EpicTokenManager {
       let unsupported = cleanupUnsupported;
       let failed = cleanupFailed;
       for (const record of records.values()) {
-        if (!record.revocationEndpoint || !this.oauth.isConnectionCompatible(record)) {
+        if (!record.revocationEndpoint || !this.oauth.canSafelyRevoke(record)) {
           unsupported = true;
           continue;
         }

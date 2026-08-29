@@ -22,7 +22,7 @@ async function main(): Promise<void> {
 
     for (const [sessionId, record] of entries) {
       try {
-        if (record.revocationEndpoint && oauth.isConnectionCompatible(record)) {
+        if (record.revocationEndpoint && oauth.canSafelyRevoke(record)) {
           await oauth.revoke(record.revocationEndpoint, record);
           remotelyRevoked += 1;
         } else {

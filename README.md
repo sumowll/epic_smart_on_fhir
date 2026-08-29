@@ -12,10 +12,20 @@ The connector implements:
 - Automatic refresh-token use with concurrent-refresh locking
 - Memory-only tokens by default, with AES-256-GCM encrypted file or Cloudflare Durable Object persistence
 - Read-only Patient access and an allowlisted, patient-constrained FHIR proxy
+- An optional encrypted FHIR hub with source-linked normalized intelligence for
+  all 22 supported resource types
 - Best-effort remote token revocation and immediate local disconnect
-- A small browser UI and JSON API
+- A patient-friendly temporal record view with grant-aware detail actions, chronological clinical events, and blank timeline positions for undated records on each displayed FHIR Bundle page, plus an advanced raw-FHIR view and JSON API
 
-MyChart is not one central API. Each healthcare organization has its own FHIR base URL and authorization server. The code is complete, but a real connection still requires an Epic-issued client ID, activation/distribution at the healthcare organization, and interactive patient consent. This application never receives or stores a MyChart username or password.
+MyChart is not one central API. Each healthcare organization has its own FHIR base URL and authorization server. The connector implements the flow described here, but a real connection still requires an Epic-issued client ID, activation/distribution at the healthcare organization, and interactive patient consent. This application never receives or stores a MyChart username or password.
+
+Production use requires more than a successful deployment. Start with the
+[production operations runbook](docs/production-operations.md), execute the
+[go-live checklist](docs/go-live-checklist.md), and give the on-call team the
+[incident and recovery playbook](docs/incident-response-and-recovery.md). Those
+documents label controls implemented by this repository separately from
+Cloudflare/Epic configuration and legal, security, monitoring, recovery, and
+organizational gates that remain the operator's responsibility.
 
 ## 1. Register an Epic patient app
 
@@ -23,19 +33,28 @@ Create an app in [Epic on FHIR](https://fhir.epic.com/Developer/Apps) and config
 
 1. Set the primary user type to **Patients**.
 2. Select **Incoming API**, **Use OAuth 2.0**, and **R4**.
-3. Register the exact callback for the environment you will run:
+3. Select **SMART Scope Version: SMART v2**. The exact catalog requires an Epic
+   November 2024 or newer target for native v2 scope formatting.
+4. Register the exact callback for the environment you will run:
 
    ```text
    http://localhost:3000/auth/callback
    ```
 
-   For Cloudflare, use the final Worker or custom-domain URL instead, for example
-   `https://epic-smart-on-fhir.<your-subdomain>.workers.dev/auth/callback`.
+   For Cloudflare, use the final custom-domain URL instead, for example
+   `https://health.example.com/auth/callback`. The checked-in production
+   configuration disables direct `workers.dev` access.
 
-4. Select only the FHIR APIs the application needs. Start with `Patient.Read (R4)` and `RelatedPerson.Read (R4)` for patient/proxy identity, then add the specific read/search APIs you intend to call. The local explorer's default resource allowlist is in `.env.example`.
-5. For the easiest local confidential-client setup, generate a sandbox client secret and choose `client_secret_basic`. Epic recommends `private_key_jwt` for production deployments.
-6. Enable **Requires Persistent Access** only if the application genuinely needs access beyond the initial token lifetime.
-7. Save the non-production client ID. Epic notes that sandbox app changes can take up to one hour to synchronize.
+5. Select only the FHIR APIs the application needs. The checked-in production
+   catalog currently approves 53 read/search scope values across 22 resource
+   types; reconcile each one with its exact Epic Incoming API using the
+   [scope catalog](docs/fhir-scope-catalog.md). Search and Read are separate, and
+   category-qualified grants are separate from unrestricted grants. The 21
+   non-Patient resource types enabled for the explorer are in `.env.example`;
+   Patient profile access is handled separately.
+6. For the easiest local confidential-client setup, generate a sandbox client secret and choose `client_secret_basic`. Epic recommends `private_key_jwt` for production deployments.
+7. Enable **Requires Persistent Access** only if the application genuinely needs access beyond the initial token lifetime.
+8. Save the non-production client ID. Epic notes that sandbox app changes can take up to one hour to synchronize.
 
 Use only Epic's synthetic [sandbox test patients](https://fhir.epic.com/Documentation?docId=testpatients) against the sandbox. A real MyChart account cannot be connected to the sandbox.
 
@@ -56,7 +75,7 @@ APP_LEGAL_NAME=replace-with-your-legal-entity-name
 APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
 APP_LEGAL_EFFECTIVE_DATE=2026-08-23
 APP_HOSTING_PROVIDER_NAME=replace-with-your-hosting-provider-name
-EPIC_CLIENT_ID=your-non-production-client-id
+EPIC_CLIENT_ID=your-environment-client-id
 EPIC_CLIENT_SECRET=your-sandbox-client-secret
 EPIC_TOKEN_AUTH_METHOD=client_secret_basic
 SESSION_SECRET=a-long-random-value
@@ -82,6 +101,13 @@ https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
 
 For a real healthcare organization, choose its R4 base from Epic's [production endpoint directory](https://open.epic.com/MyApps/Endpoints), then set `EPIC_FHIR_BASE_URL` and `EPIC_PROVIDER_NAME`. The production client ID must already be distributed and active in that environment. For a multi-provider product, periodically download and re-host Epic's User-access Brands bundle; Epic advises against depending on its directory as a runtime service.
 
+The 53-value resource catalog uses SMART v2 `.r`/`.s` scopes, including
+query-qualified permissions. Configure the Epic app's **SMART Scope Version** as
+**SMART v2** and target an Epic November 2024 or newer environment. Older Epic
+versions can return SMART v1 scope formatting even when v2 was selected; this
+connector deliberately rejects a returned grant that broadens the approved v2
+matrix.
+
 ## 3. Verify discovery and run
 
 ```bash
@@ -97,83 +123,130 @@ The connector intentionally targets current R4 SMART/OIDC discovery. A healthcar
 
 ## 4. Deploy to Cloudflare Workers
 
-The repository includes a native Worker entry point, Wrangler configuration, and a
-SQLite-backed Durable Object. Static pages and health checks are served at the Worker
-edge; each signed browser session is routed to its own Durable Object so OAuth state,
-token refresh locking, and disconnects remain strongly ordered without making one
-global object a traffic bottleneck. Pending authorization records and connection
-records are encrypted with AES-256-GCM before they are written to Durable Object
-storage.
+The repository includes a native Worker entry point, versioned Wrangler
+configuration, rate-limit bindings, and SQLite-backed Durable Objects. Static
+pages are served at the edge; each random browser route uses a strongly ordered
+Durable Object for OAuth state, refresh locking, encrypted grants, and deletion.
+A separate privacy-reduced registry coordinates account-wide disconnect without
+placing tokens, direct patient identifiers, or FHIR payloads in a global object.
 
-In the Cloudflare Git setup screen use:
+The checked-in production posture disables `workers.dev`, preview URLs, and
+automatic invocation logs. Attach the final custom domain/route before registering
+the callback with Epic. Use one isolated Worker deployment per Epic
+client/provider unless an externally reviewed multi-tenant configuration layer is
+added.
 
-```text
-Root directory:  leave blank
-Build command:   pnpm run build
-Deploy command:  pnpm run deploy
-Non-production branch deploy command:  pnpm exec wrangler versions upload
+Before upload, run:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm run verify
 ```
 
-Under **Settings → Build → Build Variables and Secrets**, set
-`PNPM_VERSION=11.22.0` so Workers Builds uses the pnpm version pinned in
-`package.json` rather than the build image's default version.
+For Cloudflare Workers Builds, leave the repository root blank and set
+`PNPM_VERSION=11.22.0` so the build uses the pnpm version pinned in
+`package.json`. This Worker uses Cloudflare's declarative Durable Object `exports`
+lifecycle, which does not support version upload or gradual deployments. Validate
+the exact candidate first in a separately named staging Worker/environment, then
+perform an approval-protected atomic production deploy. The package-level `deploy`
+command intentionally refuses direct deployment. The exact procedure, smoke tests,
+and rollback gates are in the
+[production operations runbook](docs/production-operations.md).
 
-The GitHub repository itself is the project root; do not set the root directory to
-`epic`. Wrangler bundles `src/worker.ts` and provisions the SQLite Durable Object on
-the first deploy.
+Runtime values are not Workers Builds variables. The current Wrangler file has
+`keep_vars: false`, so a deployment replaces ordinary variables that exist only in
+the dashboard. A production pipeline must either provide a protected
+environment-specific Wrangler configuration or deliberately deploy with
+`--keep-vars --strict` after checking remote drift. Do not rely on a one-time dashboard
+setup surviving the next release.
 
-After the initial deploy, open **Workers & Pages → epic-smart-on-fhir → Settings →
-Variables & Secrets**. These must be runtime values, not Workers Builds variables.
-The first deployment only provisions the Worker and Durable Object; application
-requests will fail configuration validation until these values are added and the
-settings version is deployed.
-
-Add these as ordinary variables:
+Configure these non-secret runtime variables for the target environment:
 
 ```dotenv
 APP_LEGAL_NAME=replace-with-your-legal-entity-name
 APP_LEGAL_CONTACT_EMAIL=privacy-contact@example.invalid
 APP_LEGAL_EFFECTIVE_DATE=2026-08-23
 APP_HOSTING_PROVIDER_NAME=Cloudflare
-EPIC_CLIENT_ID=your-non-production-client-id
+CONSENT_POLICY_VERSION=2026-08-23
+EPIC_CLIENT_ID=your-environment-client-id
 EPIC_TOKEN_AUTH_METHOD=client_secret_basic
 EPIC_FHIR_BASE_URL=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
 EPIC_PROVIDER_NAME=Epic R4 Sandbox
 EPIC_REDIRECT_URI=https://your-final-worker-host/auth/callback
 EPIC_SCOPES=openid fhirUser launch/patient
+EPIC_ALLOWED_RESOURCE_SCOPES=copy-the-exact-53-value-line-from-.dev.vars.example
 EPIC_REQUEST_OFFLINE_ACCESS=false
-EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Condition,DiagnosticReport,DocumentReference,Encounter,Immunization,MedicationRequest,Observation,Procedure
+EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Binary,CarePlan,CareTeam,Condition,Device,DiagnosticReport,DocumentReference,Encounter,Goal,Immunization,Location,Medication,MedicationRequest,Observation,Organization,Practitioner,PractitionerRole,Procedure,Provenance,RelatedPerson
+EPIC_TRUSTED_ENDPOINT_ORIGINS=https://fhir.epic.com
+SESSION_IDLE_TIMEOUT_SECONDS=1800
+SESSION_MAX_LIFETIME_SECONDS=28800
+TOKEN_ENCRYPTION_KEY_ID=2026-rotation-1
 ```
 
-For Epic patient-facing apps, Epic derives the granted FHIR resource scopes from the
-Incoming APIs on the app record in addition to the scopes in the authorize request.
-The connector saves and displays the literal scopes returned with the access token;
-those returned scopes, rather than the app page or `EPIC_SCOPES` alone, describe the
-current grant.
+`EPIC_SCOPES` is the short standalone authorization request: `openid fhirUser
+launch/patient` (plus `offline_access` only when explicitly approved). Epic does
+not currently support authorization POST for standalone launches, so FHIR
+resource scopes must not be placed in this GET query.
 
-Add these as encrypted secrets:
+`EPIC_ALLOWED_RESOURCE_SCOPES` is the separate 53-value upper-bound policy for
+resource grants Epic may add from the Incoming APIs configured on the app record.
+For production, make the canonical single-line value in `.dev.vars.example`
+explicit in controlled configuration and reconcile it with those Incoming APIs. The
+[scope catalog and UI mapping](docs/fhir-scope-catalog.md) lists every value and
+explains why 22 resource types become a separate Patient profile and at most 19
+searchable dropdown types plus one known-ID Provenance read choice—not 53 dropdown
+rows.
+
+Use production values only after Epic and organizational approval. For Epic
+patient-facing apps, resource grants derive from the Incoming APIs on the app
+record in addition to the authorize request. The connector saves and displays the
+literal scopes returned with the access token; those returned scopes, rather than
+the app page or either local configuration value alone, describe the current grant.
+
+Configure these encrypted runtime secrets:
 
 ```text
 EPIC_CLIENT_SECRET
 SESSION_SECRET
 TOKEN_ENCRYPTION_KEY
+TOKEN_ENCRYPTION_PREVIOUS_KEYS
 ```
 
-Generate the two application secrets separately:
+Set `TOKEN_ENCRYPTION_PREVIOUS_KEYS={}` for the first key. During rotation it is a
+JSON object from retained key IDs to their base64 keys and must remain a secret.
+For `private_key_jwt`, use `EPIC_PRIVATE_KEY_PEM` as a secret and configure the
+matching non-secret algorithm and key ID instead of using `EPIC_CLIENT_SECRET`.
+
+Generate the cookie and token secrets independently:
 
 ```bash
 openssl rand -base64 48  # SESSION_SECRET
 openssl rand -base64 32  # TOKEN_ENCRYPTION_KEY
 ```
 
-Register the exact `EPIC_REDIRECT_URI` with Epic. A `workers.dev` hostname and a
-custom domain are different OAuth callbacks, so choose the final hostname before
-requesting production activation. The same deployment exposes the public legal URLs:
+Keep recoverable copies in an approved external secret manager. The Worker
+supports retained-key rotation and lazy re-encryption; follow the
+[key-rotation procedure](docs/production-operations.md#token-encryption-key-rotation)
+rather than replacing the key in place.
+
+Verify the deployed version has the connector/registry Durable Object bindings and
+the production-unique authorization/API rate-limit namespaces. Then confirm:
 
 ```text
 https://your-final-worker-host/terms
 https://your-final-worker-host/privacy
+https://your-final-worker-host/healthz
+https://your-final-worker-host/readyz
 ```
+
+`/healthz` checks Worker configuration, required rate-limit binding presence, and
+liveness. `/readyz` checks the registry
+binding/SQL and a dedicated connector Durable Object's configuration, migrations,
+storage access, and keyring configuration. Because that connector object is
+normally empty, readiness cannot prove that every existing session record is
+decryptable; it also does not contact Epic. Use an existing-session synthetic,
+key-rotation tests, and a separate non-PHI Epic discovery synthetic for those
+checks.
 
 For local Worker development:
 
@@ -191,9 +264,11 @@ Run `pnpm run cf-typegen` after changing Worker bindings.
 The Terms and Privacy Notice are rendered once from shared code and served by both
 the Node and Cloudflare adapters at `/terms` and `/privacy`. The home page links both
 notices before the authorization action and requires an affirmative checkbox before
-enabling **Connect MyChart**. This browser-side acknowledgment is not retained as a
-consent record and must not be represented as evidence of consent; add authenticated,
-server-enforced consent/version records if the production product requires them.
+enabling **Connect MyChart**. Authorization start also enforces the current
+`CONSENT_POLICY_VERSION` on the server, and the accepted policy version and time are
+retained with the pending authorization and encrypted connection record. Counsel
+must still decide whether that receipt, identity binding, policy presentation, and
+retention satisfy the production product's consent and evidence requirements.
 
 The checked-in language describes this connector's current technical behavior, but
 it is a launch template rather than legal approval. Before using real patient data,
@@ -202,7 +277,7 @@ rules, applicable consumer-health and breach-notification laws, HIPAA role (if a
 hosting agreements and log retention, deletion procedures, governing law, and any
 warranty or liability language. Keep the notice synchronized with actual data flows;
 policy text cannot substitute for product authentication, access controls, incident
-response, or rate limiting.
+response, monitoring, or rate limiting.
 
 Set `APP_HOSTING_PROVIDER_NAME=Cloudflare` for the current Worker deployment. If the
 service later moves to AWS or another platform, change that value and review every
@@ -283,7 +358,11 @@ Stop the connector before running this command. An exclusive lock prevents the s
 
 If the process is killed without a graceful shutdown, the adjacent `.lock` file is deliberately not removed automatically. First verify that no connector or purge process is running, then remove only that exact `.lock` file and restart. This fail-closed recovery avoids two concurrent processes both deciding that a lock is stale.
 
-Local sessions and their encrypted records expire after 30 days. The service checks at startup and hourly, attempts remote revocation for expired records, and deletes them locally. Reauthorize to continue after that boundary.
+Local sessions and their encrypted records become unusable after the configured
+idle timeout or absolute lifetime—30 minutes idle and 8 hours maximum by default.
+The service checks at startup and hourly, attempts remote revocation for expired or
+policy-stale records, and deletes them locally. Reauthorize to continue after that
+boundary.
 
 Each durable grant is bound to the Epic client ID and FHIR base URL that created it. Disconnect or run `tokens:purge` with the old configuration before changing providers or client registrations. If configuration is changed first, the connector refuses to send the new client credentials to the old provider, deletes the incompatible grant locally, and requires manual removal of the old app in MyChart.
 
@@ -291,45 +370,141 @@ Each durable grant is bound to the Epic client ID and FHIR base URL that created
 
 The Worker does not use `TOKEN_STORAGE` or `TOKEN_STORE_FILE`. It always uses a
 per-session SQLite-backed Durable Object, and it requires `TOKEN_ENCRYPTION_KEY` as a
-runtime secret. Session identifiers are hashed before indexing; OAuth state, PKCE
-verifiers, nonces, patient identifiers, and OAuth tokens are stored only in encrypted
-payloads. An hourly Durable Object alarm expires old sessions and attempts the same
-best-effort remote revocation as the Node server. Pending OAuth state is checked after
-10 minutes, and idle objects remove their alarms instead of waking indefinitely.
+runtime secret. Session identifiers and OAuth states are hashed before indexing;
+OAuth state, PKCE verifiers, nonces, patient identifiers, session IDs, and OAuth
+tokens are stored only in AES-256-GCM payloads. Sensitive operational key-ID and expiry
+metadata remain outside ciphertext so rotation and eventual cleanup do not depend
+on decrypting an expired record. A versioned SQLite migration ledger prevents
+fragile untracked schema changes.
 
-`pnpm run tokens:purge` only operates on the local encrypted file. Before rotating a
-Worker encryption key, rotating `SESSION_SECRET`, or deleting Durable Object data,
-disconnect active grants or revoke the application in MyChart. Losing the old
-encryption/signing key makes existing records or their browser sessions intentionally
-unreadable; the expiry alarm remains the fallback cleanup path.
+New writes use `TOKEN_ENCRYPTION_KEY_ID`; reads try the current and retained keys
+from `TOKEN_ENCRYPTION_PREVIOUS_KEYS` and lazily re-encrypt an old record with the
+current key. Pending OAuth state expires after 10 minutes. Durable Object alarms
+prune connections about hourly, attempt best-effort remote revocation, and delete
+locally. Pre-migration records without exact expiry metadata receive a conservative
+30-day cleanup bound when the metadata migration runs.
 
-## Local JSON API
+`pnpm run tokens:purge` operates only on the local encrypted file. The Worker has
+no operator-facing fleet-wide token purge command. Follow the documented
+[rotation](docs/production-operations.md#token-encryption-key-rotation) and
+[incident](docs/incident-response-and-recovery.md) procedures; never replace a key
+under an existing key ID or remove retained keys before every dependent record has
+expired and cleanup has run.
+
+## Optional private FHIR hub
+
+The hub is disabled by default and is separate from OAuth-token persistence.
+Connecting MyChart alone never enables it. After the user accepts the current
+hub-specific notice, newly requested validated FHIR resources are stored as
+content-addressed raw versions. Each supported resource also receives a bounded,
+query-friendly projection and deterministic source-cited summary containing only
+explicit source facts. A normalization failure records a bounded reason and never
+drops the raw resource. Disconnect retains the hub, while permanent deletion is a
+separate confirmed operation.
+
+The intelligence registry covers `Patient` plus the 21 configured resource types:
+`AllergyIntolerance`, `Binary`, `CarePlan`, `CareTeam`, `Condition`, `Device`,
+`DiagnosticReport`, `DocumentReference`, `Encounter`, `Goal`, `Immunization`,
+`Location`, `Medication`, `MedicationRequest`, `Observation`, `Organization`,
+`Practitioner`, `PractitionerRole`, `Procedure`, `Provenance`, and
+`RelatedPerson`. Raw FHIR JSON remains the source of truth; projections and
+insights are separately versioned, rebuildable artifacts tied to the exact source
+content hash. The checked-in summaries use deterministic local rules and make no
+external AI/model request.
+
+```dotenv
+FHIR_HUB_ENABLED=true
+FHIR_HUB_STORE_FILE=.data/fhir-hub.enc
+FHIR_HUB_ENCRYPTION_KEY=base64-encoding-of-32-random-bytes
+FHIR_HUB_IDENTITY_KEY=a-different-base64-encoding-of-32-random-bytes
+FHIR_HUB_CONSENT_VERSION=2026-08-26
+FHIR_HUB_RETENTION_DAYS=365
+```
+
+`FHIR_HUB_CONSENT_VERSION` must identify the exact approved intelligence notice.
+Deploying a new normalizer does not silently process retained historical data.
+When the approved purpose expands, publish a new version and require the user to
+accept it; that explicit receipt is what authorizes backfilling still-retained raw
+versions. Until then, the old receipt is stale, new ingestion stops, and existing
+data remains available for export and deletion.
+
+Node uses a separately locked AES-256-GCM file. The Worker routes only by an
+opaque server-derived account reference to a separate, application-encrypted,
+account-scoped `EpicFhirHub` Durable Object. Worker saves use bounded encrypted
+chunk generations with an atomic manifest switch; the current account-state cap
+is 16 MiB. The manifest keeps only non-content generation metadata and the earliest
+cleanup deadline in plaintext, allowing scheduled or verified-account deletion
+even if ciphertext becomes unreadable. Never reuse the token, hub-data, or
+identity keys. This is currently a
+provider-scoped MyChart account vault; a real multi-provider product still needs
+Moonba authentication, an approved linking workflow, and resource-granular
+storage. See [the architecture and production gates](docs/private-fhir-hub.md).
+
+## JSON API
 
 Stateful FHIR routes require the signed, HTTP-only browser session cookie. Public UI,
 health, and disconnected-status routes do not. Tokens are never returned to the
 browser.
+
+`GET /api/connection` returns an opaque `connectionContext`. Every FHIR data and
+authenticated disconnect request must send that value as
+`X-Epic-Expected-Connection-Context`; the server rejects a stale tab before
+contacting Epic. Every successful FHIR data response repeats the value in
+`X-Epic-Connection-Context`, and the server rechecks the connection after the
+upstream request before releasing the body. The bundled UI performs both checks.
+It revalidates the connection when focus or page visibility returns while retaining
+the current in-memory search choices and results for an unchanged account. It
+scrubs them when another tab changes the connection, the connection context changes,
+authentication is lost, the user disconnects, or the page is left.
 
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/terms` | Public Terms and Conditions shown before authorization |
 | `GET` | `/privacy` | Public Privacy Notice describing health-data handling |
 | `GET` | `/healthz` | Process health |
+| `GET` | `/readyz` | Configuration and persistent-storage readiness |
 | `POST` | `/auth/start` | Begin standalone SMART authorization |
 | `GET` | `/auth/callback` | Exact registered OAuth callback |
 | `GET` | `/api/connection` | Safe connection metadata, never tokens |
 | `GET` | `/api/patient` | Read the authorized Patient resource |
-| `GET` | `/api/fhir/:resourceType` | Search an allowlisted resource, forcing the authorized patient ID |
+| `GET` | `/api/fhir/:resourceType` | Search an allowlisted resource with its approved patient-bound or scope-restricted strategy |
+| `GET` | `/api/fhir/:resourceType/:id` | Read an allowlisted resource instance after grant and fine-grained constraint validation |
+| `GET` | `/api/fhir-page?cursor=...` | Follow a server-issued, encrypted/authenticated session-bound cursor to the next safe Bundle page |
+| `GET` | `/api/hub/status` | Return consent state and privacy-safe hub counts for the live account context |
+| `POST` | `/api/hub/enable` | Record the current hub-specific consent receipt |
+| `GET` | `/api/hub/resources` | Browse current or historical retained versions for the connected patient context |
+| `GET` | `/api/hub/intelligence` | Return raw-free normalized projections and source-cited insights; supports `resourceType`, `includeHistory`, `includeSuperseded`, and `limit` filters |
+| `GET` | `/api/hub/export` | Export the account vault with raw versions, projections, provenance, and insights |
+| `POST` | `/api/hub/delete` | Permanently delete the account vault after exact confirmation |
 | `POST` | `/api/disconnect` | Revoke when supported, then delete local tokens |
+| `POST` | `/api/disconnect-all` | Disconnect every active browser route for the same verified Epic account |
 
-Search forwarding is intentionally narrow. Supported parameters are `_count`, `_sort`, `authoredon`, `category`, `class`, `clinical-status`, `code`, `date`, `docstatus`, `status`, and `type`. The caller cannot override the patient constraint, request `_include`, perform generic direct reads, or access resource types outside `EPIC_ALLOWED_RESOURCE_TYPES`.
+Search forwarding is intentionally narrow. Supported caller parameters are `_count`, `_sort`, `authoredon`, `category`, `class`, `clinical-status`, `code`, `date`, `docstatus`, `status`, and `type`. The caller cannot override the patient constraint, request `_include`/`_revinclude`, follow an arbitrary URL, or access resource types outside `EPIC_ALLOWED_RESOURCE_TYPES`. Independently of caller input, the server adds the single fixed `_revinclude=Provenance:target` value when the searched resource advertises it, Provenance is allowlisted and read-capable, and the current patient grant includes unqualified Provenance read access. Included Provenance must identify itself as an included search entry and target a primary result on the same Bundle page; all other included resource types are rejected.
 
-The generic proxy exposes the first FHIR Bundle page only. Add carefully validated same-FHIR-base pagination in an application-specific layer if needed; never send the bearer token to arbitrary Bundle links or FHIR references.
+Direct reads are limited to allowlisted resource types, require an effective Read
+grant, validate the returned resource type/ID, and enforce any category-qualified
+scope locally. Clinical searches force the authorized patient ID; approved
+supporting-resource searches rely on the patient-level SMART grant without adding
+an invalid generic `patient=` parameter. Pagination never accepts an arbitrary
+upstream URL from the browser: the server validates the same-FHIR-base Bundle link
+and issues a short-lived AES-256-GCM encrypted/authenticated cursor tied to the
+session and original search.
 
 ## Troubleshooting Epic 403 responses
 
-The resource dropdown performs FHIR **search** interactions. Each listed resource
-therefore needs its matching `*.Search ... (R4)` Incoming API; adding only its `Read`
-API is not sufficient. The separate **Load patient** action needs `Patient.Read (R4)`.
+Most resource-dropdown choices perform FHIR **search** interactions and therefore
+need their matching `*.Search ... (R4)` Incoming API; adding only `Read` is not
+sufficient for those choices. Eligible searches automatically include available
+Provenance in their Advanced JSON when Epic advertises `Provenance:target` reverse
+inclusion and the grant includes `patient/Provenance.r`. A result without an included
+Provenance record is valid and means Epic did not expose one for that page. **Record
+sources** remains an explicit direct-read option for a separately known Provenance
+FHIR ID. The separate **View profile** action needs `Patient.Read (R4)`, and opening
+a specific search result also needs that resource's **Read** permission. The UI enables actions from the
+intersection of Epic's returned SMART scopes and the server CapabilityStatement:
+resources without their choice's required interaction are hidden, while qualified
+Observation/Condition/DocumentReference grants become explicit constrained choices
+when no effective unrestricted search grant subsumes them.
 
 After adding or changing Incoming APIs:
 
@@ -338,13 +513,13 @@ After adding or changing Incoming APIs:
    environments can take up to 12 hours and may require the customer to download or
    update the client record.
 3. Expand **Access granted by Epic** in the explorer, or request
-   `GET /api/connection`, and inspect the current token's returned scopes.
+   `GET /api/connection`, and inspect the current grant's returned scope values.
 4. Disconnect the existing connection after the sync window, remove the app under
    MyChart's linked apps/devices if it remains there, and authorize it again. Refreshing
    an old grant cannot add permissions.
-5. Confirm the deployed `EPIC_CLIENT_ID` is the non-production ID for the exact app
-   record edited, the primary user type is **Patients**, and the configured FHIR base
-   is the same R4 resource server used for authorization.
+5. Confirm the deployed `EPIC_CLIENT_ID` is the environment-specific ID for the
+   exact app record edited, the primary user type is **Patients**, and the
+   configured FHIR base is the same R4 resource server used for authorization.
 
 The explorer reports `fhir_scope_denied` only when Epic returns an OAuth
 `insufficient_scope` challenge. Other Epic 403 responses use `fhir_access_denied` and
@@ -354,6 +529,13 @@ app record rather than a missing Incoming API.
 ## Disconnect and MyChart revocation
 
 The connector uses a discovered OAuth revocation endpoint when one exists and always deletes local tokens. Epic's sandbox currently does not advertise a revocation endpoint. If remote revocation is unavailable or fails, remove the app manually in MyChart under the linked apps/devices management screen.
+
+`/api/disconnect-all` uses the verified OIDC issuer and subject to coordinate
+deletion across active browser routes for the same Epic account. The registry
+stores only HMAC account references, hashed random route names, and expiry—not
+tokens, patient identifiers, or FHIR payloads. Account-wide local deletion still
+cannot guarantee remote revocation when Epic omits or fails the revocation
+endpoint, so the response and UI preserve the manual-MyChart recommendation.
 
 Disconnecting this application does not sign the patient out of MyChart.
 
@@ -366,19 +548,26 @@ The Node service is safe by default for a single-user local loopback setup:
 - Discovery and API fetches reject redirects, use timeouts and response-size limits, and require HTTPS endpoints.
 - OAuth callback parameters are checked for duplicates, state is consumed atomically, and the authorization code is removed from browser history with an immediate redirect.
 - ID tokens are verified for signature, issuer, audience, expiry, age, and nonce.
-- Application logs are disabled so authorization codes, tokens, and PHI do not enter application logs.
+- Generic request logging is disabled. Structured audit events deliberately omit URLs, query strings, OAuth values, cookies, FHIR IDs, response bodies, and tokens.
 - Responses use `no-store`, no-referrer, restrictive CSP, frame denial, and MIME hardening headers.
 
 Do not expose the local Node service on a LAN or public interface. The Cloudflare
-adapter adds HTTPS hosting, strongly ordered durable storage, encryption, and expiry,
-but it does not by itself complete a regulated production security program. Before
-using it with real patient data, add the product's authenticated user identity and
-authorization policy, managed key rotation, PHI-safe audit controls, rate limiting,
-provider-directory caching, environment-specific Epic credential mapping, and verify
-that your Cloudflare plan and contract cover the required healthcare compliance
-obligations. Keep Worker observability disabled unless URL/query redaction and log
-retention have been deliberately configured; OAuth callbacks contain short-lived
-authorization codes and state in the query string.
+adapter adds HTTPS hosting, strongly ordered per-route storage, AES-256-GCM
+encryption with retained-key rotation, versioned storage migrations, bounded
+session expiry, server-enforced policy receipts, account-wide local deletion,
+per-Cloudflare-location authorization/API rate limiting, and privacy-reduced audit events.
+These are implemented engineering controls, not a regulated production program.
+
+Before real patient data, the operator must complete the product identity and
+authorization design, Epic production distribution, BAA/legal/privacy/security
+review, protected configuration and secret management, audit delivery and access
+controls, monitoring/SLOs/on-call, penetration and load testing, retention and
+deletion, incident response, backup/recovery, and rollback gates in the
+[go-live checklist](docs/go-live-checklist.md). Worker observability is enabled for
+explicit structured events while automatic invocation logs are disabled. Review
+zone, WAF, Logpush, analytics, support, and every downstream log source separately;
+OAuth callbacks contain short-lived authorization codes and state in the query
+string.
 
 ## Development checks
 
@@ -389,7 +578,13 @@ pnpm test
 pnpm run deploy:dry-run
 ```
 
-The tests cover configuration boundaries, RFC 7636 PKCE, one-time/session-bound OAuth state, duplicate callback rejection, client-secret and private-key token authentication, OIDC verification, concurrent refresh, encrypted storage, patient-constrained FHIR calls, security headers, and a complete mocked authorization flow.
+The tests cover configuration boundaries, RFC 7636 PKCE, one-time/session-bound OAuth state, duplicate callback rejection, client-secret and private-key token authentication, OIDC verification, concurrent refresh, encrypted token and raw-FHIR storage, hub consent/backfill/retention/deletion, normalized projections and deterministic source-cited summaries for all 22 supported resource types, patient-constrained FHIR calls, security headers, and a complete mocked authorization flow.
+
+GitHub Actions runs frozen dependency installation, type-check, tests, build,
+Wrangler dry-run, production dependency audit, and CodeQL; Dependabot tracks npm
+and Actions updates. It does not deploy production. Branch protection, release
+approval, license/secret/provenance policy, and atomic Cloudflare production deployment remain
+operator gates described in the production runbook.
 
 ## Official references
 
