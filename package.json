@@ -25,7 +25,7 @@
     "verify": "pnpm run check && pnpm test && pnpm run build && pnpm run deploy:dry-run"
   },
   "dependencies": {
-    "@fastify/cookie": "^10.0.1",
+    "@fastify/cookie": "^11.1.2",
     "@fastify/formbody": "^9.0.0",
     "fastify": "^5.6.2",
     "jose": "^6.1.0",
