@@ -42,7 +42,9 @@ export async function requestJson(
   try {
     response = await options.fetch(url, {
       ...options.init,
-      redirect: "error",
+      // workerd intentionally supports only "follow" and "manual". Preserve
+      // the connector's no-redirect policy by inspecting manual responses.
+      redirect: "manual",
       signal: AbortSignal.timeout(options.timeoutMs),
       headers: {
         Accept: "application/json, application/fhir+json",
@@ -55,6 +57,17 @@ export async function requestJson(
       "The Epic server could not be reached. Please try again.",
       undefined,
       { cause: error },
+    );
+  }
+
+  if (response.status >= 300 && response.status < 400) {
+    if (response.body) {
+      await response.body.cancel().catch(() => undefined);
+    }
+    throw new UpstreamError(
+      "upstream_redirected",
+      "The Epic server returned an unexpected redirect.",
+      response.status,
     );
   }
 
