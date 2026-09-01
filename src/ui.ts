@@ -1576,6 +1576,7 @@ function sortableTimelineDate(value, valueKind = 'dateTime') {
           sortEndExclusive: true,
           floating: true,
           display: readableDate(normalized),
+          identity: 'calendar:' + normalized,
         };
   }
   if (valueKind === 'date') return null;
@@ -1605,6 +1606,8 @@ function sortableTimelineDate(value, valueKind = 'dateTime') {
     sortEndExclusive: false,
     floating: false,
     display: readableDate(normalized),
+    identity: 'instant:' + sortKey.second + ':' + sortKey.phase + ':' +
+      sortKey.fraction.replace(/0+$/, ''),
   };
 }
 
@@ -1620,6 +1623,7 @@ function timelineInstant(value, dateKind, valueKind = 'dateTime') {
     dateTime: parsed.raw,
     dateLabel: parsed.display,
     dateKind,
+    momentKey: 'point|' + parsed.identity,
   };
 }
 
@@ -1653,11 +1657,35 @@ function timelinePeriod(value, dateKind) {
     dateTime: anchor.raw,
     dateLabel,
     dateKind,
+    momentKey: 'period|' + (start ? start.identity : 'open') + '|' +
+      (end ? end.identity : 'open'),
   };
 }
 
 function compactTimelineMoments(candidates) {
   return candidates.flat().filter((candidate) => candidate !== null);
+}
+
+function coalesceTimelineMoments(moments) {
+  const coalesced = [];
+  const byPosition = new Map();
+  for (const moment of moments) {
+    const existing = byPosition.get(moment.momentKey);
+    if (!existing) {
+      const firstAtPosition = { ...moment };
+      byPosition.set(moment.momentKey, {
+        moment: firstAtPosition,
+        dateKinds: new Set([moment.dateKind]),
+      });
+      coalesced.push(firstAtPosition);
+      continue;
+    }
+    if (!existing.dateKinds.has(moment.dateKind)) {
+      existing.dateKinds.add(moment.dateKind);
+      existing.moment.dateKind = Array.from(existing.dateKinds).join(' · ');
+    }
+  }
+  return coalesced;
 }
 
 function firstTimelineChoice(candidateGroups) {
@@ -1857,7 +1885,7 @@ function timelineMomentsForResource(resource) {
 function temporalEventsForResource(resource, sourceIndex) {
   const title = resourceTitle(resource);
   const resourceKind = friendlyResourceName(resource.resourceType);
-  return timelineMomentsForResource(resource).map((moment, occurrenceIndex) => ({
+  return coalesceTimelineMoments(timelineMomentsForResource(resource)).map((moment, occurrenceIndex) => ({
     ...moment,
     resource,
     title,

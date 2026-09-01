@@ -1223,6 +1223,99 @@ describe("legal pages", () => {
     expect(harness.elements["#result-list"].hidden).toBe(true);
   });
 
+  it("coalesces matching moments within one record while keeping records and dates distinct", async () => {
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Patient.r"],
+          capabilities: [{
+            resourceType: "Patient",
+            read: true,
+            readConstraintAlternatives: [[]],
+            search: false,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/matching-moments") {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [
+            {
+              resource: {
+                resourceType: "Condition",
+                id: "same-date",
+                code: { text: "Same-date condition" },
+                onsetDateTime: "2019-04-23",
+                recordedDate: "2019-04-23",
+              },
+            },
+            {
+              resource: {
+                resourceType: "Condition",
+                id: "distinct-dates",
+                code: { text: "Distinct-date condition" },
+                onsetDateTime: "2019-04-23",
+                recordedDate: "2019-04-24",
+              },
+            },
+            {
+              resource: {
+                resourceType: "Observation",
+                id: "same-instant",
+                code: { text: "Same-instant observation" },
+                effectiveDateTime: "2020-01-01T00:00:00.1000Z",
+                issued: "2019-12-31T19:00:00.1-05:00",
+              },
+            },
+          ],
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/matching-moments", "Matching moments");
+
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children.map((item) => ({
+      dateTime: item.children[0]?.getAttribute("datetime"),
+      title: item.children[1]?.children.find((child) => child.tagName === "H4")?.textContent,
+      dateKind: item.children[1]?.children.find(
+        (child) => child.className === "timeline-date-kind",
+      )?.textContent,
+    }))).toEqual([
+      {
+        dateTime: "2019-04-23",
+        title: "Same-date condition",
+        dateKind: "Onset · Recorded",
+      },
+      {
+        dateTime: "2019-04-23",
+        title: "Distinct-date condition",
+        dateKind: "Onset",
+      },
+      {
+        dateTime: "2019-04-24",
+        title: "Distinct-date condition",
+        dateKind: "Recorded",
+      },
+      {
+        dateTime: "2020-01-01T00:00:00.1000Z",
+        title: "Same-instant observation",
+        dateKind: "Clinically relevant time · Issued",
+      },
+    ]);
+    expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
+      "4 dated events from 3 of 3 records",
+    );
+  });
+
   it("validates FHIR date precision, leap seconds, and timezone limits by field type", async () => {
     const harness = createBrowserHarness(async (path) => {
       if (path === "/api/connection") {
