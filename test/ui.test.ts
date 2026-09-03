@@ -106,13 +106,14 @@ function jsonResponse(
   value: unknown,
   status = 200,
   connectionContext = connectionContextA,
+  extraHeaders?: HeadersInit,
 ): Response {
+  const headers = new Headers(extraHeaders);
+  headers.set("Content-Type", "application/json");
+  headers.set("X-Epic-Connection-Context", connectionContext);
   return new Response(JSON.stringify(value), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Epic-Connection-Context": connectionContext,
-    },
+    headers,
   });
 }
 
@@ -150,6 +151,15 @@ function createBrowserHarness(
     "#temporal-graph-list",
     "#temporal-graph-order",
     "#result-list",
+    "#response-trace",
+    "#response-trace-source",
+    "#response-trace-connector",
+    "#response-trace-display",
+    "#response-trace-reference",
+    "#field-check-form",
+    "#field-check-path",
+    "#field-check",
+    "#field-check-result",
     "#advanced-result",
     "#copy-resources",
     "#copy-resources-status",
@@ -358,7 +368,9 @@ describe("legal pages", () => {
     expect(html).toContain('<optgroup label="Results">');
     expect(html).toContain('Conditions and health concerns');
     expect(html).toContain('Labs, vital signs, and observations');
-    expect(html).toContain('Advanced: raw FHIR JSON');
+    expect(html).toContain('Response trace: where information can go missing');
+    expect(html).toContain('id="field-check-form"');
+    expect(html).toContain('Advanced: complete application FHIR JSON');
     expect(html).toContain('id="copy-resources"');
     expect(html).toContain('id="copy-resources-status"');
     expect(html).toContain('id="result-list"');
@@ -751,9 +763,222 @@ describe("legal pages", () => {
 
     expect(harness.clipboardWrites()).toEqual([displayedJson]);
     expect(harness.elements["#copy-resources-status"].textContent).toBe(
-      "Raw FHIR JSON copied to your clipboard.",
+      "Application FHIR JSON copied to your clipboard.",
     );
     expect(harness.elements["#copy-resources"].disabled).toBe(false);
+  });
+
+  it("traces a direct Epic response and classifies present, UI-only, and source-absent fields", async () => {
+    const response = {
+      resourceType: "Observation",
+      id: "observation-1",
+      status: "final",
+      code: { text: "Example result" },
+      valueQuantity: { value: 7, unit: "mg" },
+      extension: [{ url: "https://example.test/fhir/StructureDefinition/example", valueString: "kept" }],
+    };
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Observation.r"],
+          capabilities: [{
+            resourceType: "Observation",
+            read: true,
+            readConstraintAlternatives: [[]],
+            search: false,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/trace-fhir") {
+        return jsonResponse(response, 200, connectionContextA, {
+          "X-Request-ID": "request-trace-1",
+          "X-Moonba-FHIR-Source": "epic",
+          "X-Moonba-FHIR-Interaction": "read",
+          "X-Moonba-FHIR-Resource-Type": "Observation",
+          "X-Moonba-FHIR-Resource-Fields": "preserved",
+          "X-Moonba-FHIR-Transforms": "json-parsed,validated",
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/trace-fhir", "Example observation");
+
+    expect(harness.elements["#response-trace"].hidden).toBe(false);
+    expect(harness.elements["#response-trace-source"].textContent).toContain(
+      "Epic returned this Observation resource",
+    );
+    expect(harness.elements["#response-trace-connector"].textContent).toContain(
+      "preserved every field",
+    );
+    expect(harness.elements["#response-trace-display"].textContent).toContain(
+      "selective summary",
+    );
+    expect(harness.elements["#response-trace-reference"].textContent).toContain("HTTP 200");
+    expect(harness.elements["#response-trace-reference"].textContent).toContain("request-trace-1");
+    expect(harness.elements["#result"].textContent).toContain('"extension"');
+    expect([...cardDetails(harness.elements["#result-list"].children[0]).values()].join(" ")).not.toContain(
+      "https://example.test/fhir/StructureDefinition/example",
+    );
+
+    harness.elements["#field-check-path"].value = "extension";
+    await harness.elements["#field-check-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+    expect(harness.elements["#field-check-result"].textContent).toContain("It reached this browser");
+    expect(harness.elements["#field-check-result"].textContent).toContain("UI summary omitted it");
+    expect(harness.elements["#field-check-result"].textContent).not.toContain("kept");
+
+    harness.elements["#field-check-path"].value = "referenceRange.low.value";
+    await harness.elements["#field-check-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+    expect(harness.elements["#field-check-result"].textContent).toContain(
+      "Epic did not include this field or path in this read response",
+    );
+
+    await harness.dispatchWindowEvent("pagehide");
+    expect(harness.elements["#response-trace"].hidden).toBe(true);
+    expect(harness.elements["#response-trace-source"].textContent).toBe("");
+    expect(harness.elements["#field-check-result"].textContent).toBe("");
+  });
+
+  it("explains search transformations and keeps search absence scoped to the current page", async () => {
+    const response = {
+      resourceType: "Bundle",
+      type: "searchset",
+      link: [{ relation: "next", url: "/api/fhir-page?cursor=safe" }],
+      entry: [{
+        resource: {
+          resourceType: "Observation",
+          id: "observation-1",
+          component: [{ valueQuantity: { value: 120, unit: "mmHg" } }],
+        },
+      }],
+    };
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Observation.s"],
+          capabilities: [{ resourceType: "Observation", read: false, search: true, searchConstraints: [] }],
+        });
+      }
+      if (path === "/search-trace") {
+        return jsonResponse(response, 200, connectionContextA, {
+          "X-Request-ID": "request-search-1",
+          "X-Moonba-FHIR-Source": "epic",
+          "X-Moonba-FHIR-Interaction": "search",
+          "X-Moonba-FHIR-Resource-Type": "Observation",
+          "X-Moonba-FHIR-Resource-Fields": "preserved",
+          "X-Moonba-FHIR-Transforms": "json-parsed,validated,bundle-links-rewritten",
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/search-trace", "Observations");
+
+    expect(harness.elements["#response-trace-source"].textContent).toContain(
+      "Epic returned this Observation search page",
+    );
+    expect(harness.elements["#response-trace-connector"].textContent).toContain(
+      "replaced Epic’s Bundle navigation links",
+    );
+    harness.elements["#field-check-path"].value = "component.valueQuantity.value";
+    await harness.elements["#field-check-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+    expect(harness.elements["#field-check-result"].textContent).toContain("Found");
+
+    harness.elements["#field-check-path"].value = "referenceRange.low.value";
+    await harness.elements["#field-check-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+    expect(harness.elements["#field-check-result"].textContent).toContain(
+      "not present in any resource on this Epic search page",
+    );
+    expect(harness.elements["#field-check-result"].textContent).toContain(
+      "filters, the current grant, result limits, or another page",
+    );
+  });
+
+  it("identifies connector-derived and incomplete Location responses", async () => {
+    const response = {
+      resourceType: "Bundle",
+      type: "searchset",
+      entry: [{
+        resource: {
+          resourceType: "Location",
+          id: "location-1",
+          name: "Example clinic",
+          address: { city: "Example City" },
+        },
+      }, {
+        resource: {
+          resourceType: "OperationOutcome",
+          issue: [{ severity: "warning", code: "incomplete" }],
+        },
+        search: { mode: "outcome" },
+      }],
+    };
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Encounter.s", "patient/Location.r"],
+          capabilities: [],
+        });
+      }
+      if (path === "/location-trace") {
+        return jsonResponse(response, 200, connectionContextA, {
+          "X-Request-ID": "request-location-1",
+          "X-Moonba-FHIR-Source": "connector-derived",
+          "X-Moonba-FHIR-Interaction": "search",
+          "X-Moonba-FHIR-Resource-Type": "Location",
+          "X-Moonba-FHIR-Resource-Fields": "preserved",
+          "X-Moonba-FHIR-Transforms": "json-parsed,validated,derived-from-encounter-references,bundle-generated",
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/location-trace", "Care locations");
+
+    expect(harness.elements["#response-trace-source"].textContent).toContain(
+      "not a direct Epic Location search response",
+    );
+    expect(harness.elements["#response-trace-connector"].textContent).toContain(
+      "generated the Bundle",
+    );
+    expect(harness.elements["#response-trace-connector"].textContent).toContain("incomplete");
+    expect(harness.elements["#response-trace-display"].textContent).toContain(
+      "expands every top-level field",
+    );
+    harness.elements["#field-check-path"].value = "hoursOfOperation";
+    await harness.elements["#field-check-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+    expect(harness.elements["#field-check-result"].textContent).toContain(
+      "not present in this connector-derived response",
+    );
+    expect(harness.elements["#field-check-result"].textContent).toContain(
+      "does not prove that Epic lacks",
+    );
   });
 
   it("keeps included Provenance in Advanced but out of primary counts and the timeline", async () => {
@@ -850,7 +1075,7 @@ describe("legal pages", () => {
 
     expect(harness.clipboardWrites()).toEqual([]);
     expect(harness.elements["#copy-resources-status"].textContent).toBe(
-      "Could not copy. Select the raw JSON and copy it manually.",
+      "Could not copy. Select the application JSON and copy it manually.",
     );
     expect(harness.elements["#result"].textContent).toBe(displayedJson);
     expect(harness.elements["#copy-resources"].disabled).toBe(false);
@@ -902,7 +1127,7 @@ describe("legal pages", () => {
         if (detailReads > 1) {
           return jsonResponse({
             error: { code: "fhir_scope_denied", message: "This detail is no longer available." },
-          }, 403);
+          }, 403, connectionContextA, { "X-Request-ID": "request-detail-403" });
         }
         return jsonResponse({
           resourceType: "Observation",
@@ -958,6 +1183,9 @@ describe("legal pages", () => {
     )!;
     await retriedDetailButton.dispatch("click");
     expect(harness.elements["#result-error"].textContent).toContain("no longer available");
+    expect(harness.elements["#result-error"].textContent).toContain(
+      "HTTP 403 · error fhir_scope_denied · request request-detail-403",
+    );
     expect(harness.elements["#result"].textContent).toContain('"resourceType": "Bundle"');
   });
 

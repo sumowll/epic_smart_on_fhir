@@ -497,6 +497,12 @@ the current in-memory search choices and results for an unchanged account. It
 scrubs them when another tab changes the connection, the connection context changes,
 authentication is lost, the user disconnects, or the page is left.
 
+Successful FHIR data responses also carry bounded `X-Moonba-FHIR-*` trace
+headers for source mode, interaction, resource type, resource-field preservation,
+and connector transforms. The values come from fixed enums and never contain a
+FHIR ID, URL, query value, response body, patient detail, or token. Error responses
+do not attest successful processing with these headers.
+
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/terms` | Public Terms and Conditions shown before authorization |
@@ -539,6 +545,42 @@ partial result. Pagination never accepts an arbitrary
 upstream URL from the browser: the server validates the same-FHIR-base Bundle link
 and issues a short-lived AES-256-GCM encrypted/authenticated cursor tied to the
 session and original search.
+
+## Tracing a missing FHIR field
+
+Every successful health-data view includes an ephemeral **Response trace**. It
+separates the provider response, connector processing, and the friendly display,
+and it includes a field/path checker that reports presence without repeating the
+field value. The Advanced panel contains the complete parsed FHIR JSON delivered
+by this application; it is not the original HTTP byte stream.
+
+Use the trace as a decision tree:
+
+1. If a field is found in the complete application JSON but not on the friendly
+   card, the UI summary omitted it. Most resource cards intentionally select a
+   small set of readable fields; Patient and Location views expand every returned
+   top-level field.
+2. If a field is absent from an ordinary direct-read response, the response trace
+   attests that resource fields were preserved, so Epic did not include that field
+   in that read response.
+3. If a field is absent from a search response, it was not present on that page
+   under the current grant, filters, and result count. Check safe subsequent pages;
+   absence on one page does not prove the provider has no such data.
+4. Location results are connector-derived from authorized Encounter references and
+   bounded individual Location reads. An `OperationOutcome` with code `incomplete`
+   means unresolved, unavailable, or safety-limited references can make the result
+   partial.
+5. Search resource fields are preserved, but upstream `Bundle.link` values are
+   replaced with a safe session-bound next-page cursor. Included Provenance and
+   processing notices remain in the complete application JSON even when the
+   friendly timeline summarizes them.
+
+The trace also shows the safe `X-Request-ID`. Share that request reference and a
+safe error code with support—not real FHIR JSON, screenshots, patient identifiers,
+URLs, cookies, or tokens. For operator-only source comparison, the `fhir:get`
+utility above must use the same provider, grant, resource, and effective filters.
+Keep its access token only in the current process environment and never in `.env`,
+arguments, logs, or support evidence.
 
 ## Troubleshooting Epic 403 responses
 

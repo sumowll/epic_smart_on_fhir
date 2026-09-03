@@ -17,6 +17,26 @@ const smartCapabilities = [
   "sso-openid-connect",
 ];
 
+function expectFhirTrace(
+  headers: Headers,
+  expected: {
+    readonly source: "epic" | "connector-derived";
+    readonly interaction: "read" | "search";
+    readonly resourceType: string;
+    readonly transforms: string;
+  },
+): void {
+  expect(Object.fromEntries(
+    [...headers.entries()].filter(([name]) => name.startsWith("x-moonba-fhir-")),
+  )).toEqual({
+    "x-moonba-fhir-source": expected.source,
+    "x-moonba-fhir-interaction": expected.interaction,
+    "x-moonba-fhir-resource-type": expected.resourceType,
+    "x-moonba-fhir-resource-fields": "preserved",
+    "x-moonba-fhir-transforms": expected.transforms,
+  });
+}
+
 afterEach(async () => {
   await Promise.all(openServices.splice(0).map((service) => service.close()));
 });
@@ -166,6 +186,153 @@ describe("Cloudflare Worker HTTP application", () => {
       connected: false,
       provider: "Example Health",
     });
+  });
+
+  it("matches Fastify FHIR trace headers without exposing request details", async () => {
+    const config = makeConfig({
+      EPIC_REDIRECT_URI: "https://connector.example.test/auth/callback",
+    });
+    const sessionId = "t".repeat(43);
+    const connectionContext = "c".repeat(43);
+    const service = {
+      config,
+      startAuthorization: vi.fn(async () => "https://ehr.example.test/authorize"),
+      readPatientBound: vi.fn(async () => ({
+        value: { resourceType: "Patient", id: "patient-private" },
+        connectionContext,
+      })),
+      readBound: vi.fn(async () => ({
+        value: { resourceType: "Condition", id: "condition-private" },
+        connectionContext,
+      })),
+      searchBound: vi.fn(async (_sessionId: string, resourceType: string) => ({
+        value: { resourceType: "Bundle", type: "searchset", entry: [] },
+        connectionContext,
+        resourceType,
+      })),
+      pageBound: vi.fn(async () => ({
+        value: { resourceType: "Bundle", type: "searchset", entry: [] },
+        connectionContext,
+        resourceType: "Condition",
+      })),
+    } as unknown as EpicConnectorService;
+    const app = new WorkerHttpApplication(service);
+
+    const start = await app.fetch(new Request("https://connector.example.test/auth/start", {
+      method: "POST",
+      headers: {
+        Origin: config.publicOrigin,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        consent: "accepted",
+        policyVersion: config.consentPolicyVersion,
+      }),
+    }), sessionId, sessionId);
+    const cookie = start.headers.get("set-cookie")!.split(";", 1)[0]!;
+    const boundHeaders = {
+      Cookie: cookie,
+      "X-Epic-Expected-Connection-Context": connectionContext,
+    };
+
+    const patient = await app.fetch(
+      new Request("https://connector.example.test/api/patient", { headers: boundHeaders }),
+      sessionId,
+      sessionId,
+    );
+    expect(patient.status).toBe(200);
+    expectFhirTrace(patient.headers, {
+      source: "epic",
+      interaction: "read",
+      resourceType: "Patient",
+      transforms: "json-parsed,validated",
+    });
+
+    const read = await app.fetch(
+      new Request(
+        "https://connector.example.test/api/fhir/Condition/condition-private",
+        { headers: boundHeaders },
+      ),
+      sessionId,
+      sessionId,
+    );
+    expect(read.status).toBe(200);
+    expectFhirTrace(read.headers, {
+      source: "epic",
+      interaction: "read",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated",
+    });
+
+    const search = await app.fetch(
+      new Request(
+        "https://connector.example.test/api/fhir/Condition?code=private-query",
+        { headers: boundHeaders },
+      ),
+      sessionId,
+      sessionId,
+    );
+    expect(search.status).toBe(200);
+    expectFhirTrace(search.headers, {
+      source: "epic",
+      interaction: "search",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated,bundle-links-rewritten",
+    });
+
+    const page = await app.fetch(
+      new Request(
+        "https://connector.example.test/api/fhir-page?cursor=private-cursor",
+        { headers: boundHeaders },
+      ),
+      sessionId,
+      sessionId,
+    );
+    expect(page.status).toBe(200);
+    expectFhirTrace(page.headers, {
+      source: "epic",
+      interaction: "search",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated,bundle-links-rewritten",
+    });
+
+    const locations = await app.fetch(
+      new Request(
+        "https://connector.example.test/api/fhir/Location?_count=1",
+        { headers: boundHeaders },
+      ),
+      sessionId,
+      sessionId,
+    );
+    expect(locations.status).toBe(200);
+    expectFhirTrace(locations.headers, {
+      source: "connector-derived",
+      interaction: "search",
+      resourceType: "Location",
+      transforms:
+        "json-parsed,validated,derived-from-encounter-references,bundle-generated",
+    });
+
+    const traceValues = [patient, read, search, page, locations]
+      .flatMap((response) => [...response.headers.entries()])
+      .filter(([name]) => name.startsWith("x-moonba-fhir-"))
+      .map(([, value]) => value)
+      .join("|");
+    expect(traceValues).not.toContain("private");
+    expect(traceValues).not.toContain("https://");
+    for (const response of [patient, read, search, page, locations]) {
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    }
+
+    const invalidPage = await app.fetch(
+      new Request("https://connector.example.test/api/fhir-page?cursor=", {
+        headers: boundHeaders,
+      }),
+      sessionId,
+      sessionId,
+    );
+    expect(invalidPage.status).toBe(400);
+    expect(invalidPage.headers.get("x-moonba-fhir-source")).toBeNull();
   });
 
   it("serves public Terms and Privacy pages, including HEAD", async () => {

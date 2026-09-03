@@ -11,6 +11,7 @@ import {
 import { EpicConnectorService } from "./connector.js";
 import { contentSecurityPolicy } from "./csp.js";
 import { AppError, ReconnectRequiredError, safeErrorDiagnostic } from "./errors.js";
+import { fhirResponseTraceHeaders } from "./fhir-response-trace.js";
 import type { FhirHubIntelligenceOptions, FhirHubListOptions } from "./fhir-hub.js";
 import { FixedWindowRateLimiter } from "./rate-limit.js";
 import { randomBase64Url } from "./security.js";
@@ -783,6 +784,7 @@ export class WorkerHttpApplication {
       });
       return this.json(result.value, 200, false, {
         "X-Epic-Connection-Context": result.connectionContext,
+        ...fhirResponseTraceHeaders("Patient", "read"),
       });
     }
     if (request.method === "GET" && pathname === "/api/fhir-page") {
@@ -807,6 +809,7 @@ export class WorkerHttpApplication {
       });
       return this.json(result.value, 200, false, {
         "X-Epic-Connection-Context": result.connectionContext,
+        ...fhirResponseTraceHeaders(result.resourceType, "search"),
       });
     }
     if (request.method === "GET" && pathname.startsWith("/api/fhir/")) {
@@ -845,6 +848,7 @@ export class WorkerHttpApplication {
         });
         return this.json(result.value, 200, false, {
           "X-Epic-Connection-Context": result.connectionContext,
+          ...fhirResponseTraceHeaders(resourceType, "read"),
         });
       }
       const result = await this.service.searchBound(
@@ -863,6 +867,7 @@ export class WorkerHttpApplication {
       });
       return this.json(result.value, 200, false, {
         "X-Epic-Connection-Context": result.connectionContext,
+        ...fhirResponseTraceHeaders(resourceType, "search"),
       });
     }
     if (request.method === "POST" && pathname === "/api/disconnect") {

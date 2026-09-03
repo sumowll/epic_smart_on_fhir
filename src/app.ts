@@ -14,6 +14,10 @@ import {
 import { EpicConnectorService } from "./connector.js";
 import { contentSecurityPolicy } from "./csp.js";
 import { AppError, ReconnectRequiredError, safeErrorDiagnostic } from "./errors.js";
+import {
+  fhirResponseTraceHeaders,
+  type FhirResponseTraceInteraction,
+} from "./fhir-response-trace.js";
 import { EncryptedFileFhirHubRepository } from "./fhir-hub-file.js";
 import {
   DisabledFhirHubRepository,
@@ -46,6 +50,18 @@ import {
 function acceptsJson(value: string | undefined): boolean {
   return value?.split(",").some((entry) =>
     entry.split(";", 1)[0]?.trim().toLowerCase() === "application/json") ?? false;
+}
+
+function applyFhirResponseTraceHeaders(
+  reply: FastifyReply,
+  resourceType: string,
+  interaction: FhirResponseTraceInteraction,
+): void {
+  for (const [name, value] of Object.entries(
+    fhirResponseTraceHeaders(resourceType, interaction),
+  )) {
+    reply.header(name, value);
+  }
 }
 
 export interface AppDependencies {
@@ -594,6 +610,7 @@ async function configureApp(
       expectedConnectionContext(request),
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
+    applyFhirResponseTraceHeaders(reply, "Patient", "read");
     void emitAudit(audit, {
       event: "fhir_access",
       outcome: "success",
@@ -619,6 +636,7 @@ async function configureApp(
       expectedConnectionContext(request),
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
+    applyFhirResponseTraceHeaders(reply, result.resourceType, "search");
     void emitAudit(audit, {
       event: "fhir_access",
       outcome: "success",
@@ -642,6 +660,7 @@ async function configureApp(
         expectedConnectionContext(request),
       );
       reply.header("X-Epic-Connection-Context", result.connectionContext);
+      applyFhirResponseTraceHeaders(reply, request.params.resourceType, "read");
       void emitAudit(audit, {
         event: "fhir_access",
         outcome: "success",
@@ -665,6 +684,7 @@ async function configureApp(
       expectedConnectionContext(request),
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
+    applyFhirResponseTraceHeaders(reply, request.params.resourceType, "search");
     void emitAudit(audit, {
       event: "fhir_access",
       outcome: "success",

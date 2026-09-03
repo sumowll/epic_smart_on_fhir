@@ -212,14 +212,33 @@ export function renderHome(config: AppConfig): string {
           <ol id="temporal-graph-list" class="temporal-graph-list" aria-label="Health events in chronological order"></ol>
         </section>
         <section id="result-list" class="result-list" aria-label="Health records" hidden></section>
+        <details id="response-trace" class="response-trace" hidden>
+          <summary>Response trace: where information can go missing</summary>
+          <p class="hint">This trace describes the current in-memory response without copying health values into logs or support data.</p>
+          <ol class="response-trace-stages">
+            <li><strong>FHIR source</strong><span id="response-trace-source"></span></li>
+            <li><strong>Connector processing</strong><span id="response-trace-connector"></span></li>
+            <li><strong>Friendly display</strong><span id="response-trace-display"></span></li>
+          </ol>
+          <form id="field-check-form" class="field-check-form">
+            <label for="field-check-path">Check a FHIR field or dot path in this response</label>
+            <div class="field-check-row">
+              <input id="field-check-path" type="text" maxlength="160" placeholder="Example: valueQuantity.value" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="field-check-hint field-check-result">
+              <button id="field-check" class="secondary" type="submit">Check field</button>
+            </div>
+            <p id="field-check-hint" class="hint">Use a field name such as <code>telecom</code> or a dot path such as <code>valueQuantity.value</code>. The check reports presence only; it does not repeat the value.</p>
+            <p id="field-check-result" class="field-check-result" role="status" aria-live="polite"></p>
+          </form>
+          <p id="response-trace-reference" class="hint"></p>
+        </details>
         <details id="advanced-result" class="advanced-result" hidden>
-          <summary>Advanced: raw FHIR JSON</summary>
-          <p class="hint">This technical view can contain sensitive health information. Close it when you are finished.</p>
+          <summary>Advanced: complete application FHIR JSON</summary>
+          <p class="hint">This is the complete parsed FHIR response delivered by this application, not the original HTTP bytes. It can contain sensitive health information. Close it when you are finished.</p>
           <div class="advanced-actions">
-            <button id="copy-resources" class="secondary" type="button" disabled>Copy resources</button>
+            <button id="copy-resources" class="secondary" type="button" disabled>Copy application JSON</button>
             <span id="copy-resources-status" class="copy-status" role="status" aria-live="polite"></span>
           </div>
-          <pre id="result" tabindex="0" aria-label="Raw FHIR JSON"></pre>
+          <pre id="result" tabindex="0" aria-label="Complete application FHIR JSON"></pre>
         </details>
         <nav id="pagination-controls" class="pagination-controls" aria-label="FHIR result pages" hidden></nav>
       </section>
@@ -566,6 +585,17 @@ select, input { width: 100%; border: 1px solid #c8d7db; border-radius: 9px; back
 .result-card button { margin-top: 14px; }
 .empty-result { margin: 0; padding: 16px; border: 1px dashed #c8d7db; border-radius: 12px; color: #526c74; }
 .result-warning { margin: 0; padding: 13px 15px; border-radius: 10px; background: #fff1c9; color: #704d08; line-height: 1.5; }
+.response-trace { margin-top: 16px; padding: 14px 16px; border: 1px solid #cfe0e3; border-radius: 12px; background: #f7fbfb; }
+.response-trace summary { cursor: pointer; color: #21444e; font-weight: 800; }
+.response-trace > .hint { margin: 10px 0; }
+.response-trace-stages { display: grid; gap: 10px; margin: 14px 0; padding-left: 22px; }
+.response-trace-stages li { color: #36545d; line-height: 1.5; }
+.response-trace-stages strong { display: block; color: #15313a; }
+.response-trace-stages span { display: block; }
+.field-check-form { margin-top: 16px; padding-top: 14px; border-top: 1px solid #d8e3e7; }
+.field-check-row { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; margin-top: 7px; }
+.field-check-form .hint { margin: 8px 0 0; }
+.field-check-result { min-height: 1.5em; margin: 10px 0 0; color: #21444e; font-weight: 700; line-height: 1.5; }
 .advanced-result { margin-top: 16px; }
 .advanced-result summary { cursor: pointer; color: #36545d; font-weight: 750; }
 .advanced-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 10px 0; }
@@ -614,6 +644,7 @@ a:hover { color: #064f4a; }
   .temporal-graph-heading { flex-direction: column; }
   .timeline-event { grid-template-columns: 1fr; gap: 5px; }
   .timeline-event-undated .timeline-time-empty { display: none; }
+  .field-check-row { grid-template-columns: 1fr; }
   .result-card dl, .timeline-event-card dl { grid-template-columns: 1fr; gap: 3px; }
   .result-card dd + dt, .timeline-event-card dd + dt { margin-top: 7px; }
 }
@@ -637,6 +668,15 @@ const temporalGraphSummary = document.querySelector('#temporal-graph-summary');
 const temporalGraphList = document.querySelector('#temporal-graph-list');
 const temporalGraphOrder = document.querySelector('#temporal-graph-order');
 const resultList = document.querySelector('#result-list');
+const responseTrace = document.querySelector('#response-trace');
+const responseTraceSource = document.querySelector('#response-trace-source');
+const responseTraceConnector = document.querySelector('#response-trace-connector');
+const responseTraceDisplay = document.querySelector('#response-trace-display');
+const responseTraceReference = document.querySelector('#response-trace-reference');
+const fieldCheckForm = document.querySelector('#field-check-form');
+const fieldCheckPath = document.querySelector('#field-check-path');
+const fieldCheckButton = document.querySelector('#field-check');
+const fieldCheckResult = document.querySelector('#field-check-result');
 const advancedResult = document.querySelector('#advanced-result');
 const copyResourcesButton = document.querySelector('#copy-resources');
 const copyResourcesStatus = document.querySelector('#copy-resources-status');
@@ -700,6 +740,7 @@ let activeConstraintControls = [];
 let activeResultButtons = [];
 let activeTimelineButtons = [];
 let currentDataView = null;
+let currentResponseTrace = null;
 let temporalEvents = [];
 let temporalRecordCount = 0;
 let temporalDatedRecordCount = 0;
@@ -711,12 +752,69 @@ const connectionChannel = typeof window.BroadcastChannel === 'function'
   ? new window.BroadcastChannel('epic-connection-state-v1')
   : null;
 
+const knownFhirTraceTransforms = new Set([
+  'json-parsed',
+  'validated',
+  'bundle-links-rewritten',
+  'derived-from-encounter-references',
+  'bundle-generated',
+]);
+
+function safeResponseHeader(response, name, pattern, maximumLength) {
+  const value = response.headers.get(name);
+  if (!value || value.length > maximumLength || !pattern.test(value)) return null;
+  return value;
+}
+
+function responseRequestId(response) {
+  return safeResponseHeader(response, 'X-Request-ID', /^[A-Za-z0-9._:-]+$/, 128);
+}
+
+function readFhirResponseTrace(response) {
+  const source = safeResponseHeader(
+    response,
+    'X-Moonba-FHIR-Source',
+    /^(?:epic|connector-derived)$/,
+    32,
+  );
+  const interaction = safeResponseHeader(
+    response,
+    'X-Moonba-FHIR-Interaction',
+    /^(?:read|search)$/,
+    16,
+  );
+  const resourceType = safeResponseHeader(
+    response,
+    'X-Moonba-FHIR-Resource-Type',
+    /^[A-Z][A-Za-z0-9]{0,63}$/,
+    64,
+  );
+  const transformHeader = response.headers.get('X-Moonba-FHIR-Transforms');
+  const transforms = typeof transformHeader === 'string' && transformHeader.length <= 256
+    ? transformHeader.split(',').map((value) => value.trim()).filter((value) =>
+        knownFhirTraceTransforms.has(value)
+      )
+    : [];
+  const fieldsPreserved = response.headers.get('X-Moonba-FHIR-Resource-Fields') === 'preserved';
+  return {
+    source,
+    interaction,
+    resourceType,
+    transforms,
+    fieldsPreserved,
+    requestId: responseRequestId(response),
+    status: response.status,
+  };
+}
+
 async function api(path, options) {
   const requestOptions = options || {};
   const requestHeaders = requestOptions.headers || {};
   const expectedConnectionContext = requestOptions.expectedConnectionContext;
+  const captureFhirTrace = requestOptions.captureFhirTrace === true;
   const fetchOptions = { ...requestOptions };
   delete fetchOptions.expectedConnectionContext;
+  delete fetchOptions.captureFhirTrace;
   const headers = new Headers(requestHeaders);
   headers.set('Accept', 'application/json');
   if (typeof expectedConnectionContext === 'string') {
@@ -737,6 +835,7 @@ async function api(path, options) {
     const error = new Error('The MyChart account context changed. Review the current connection before loading data.');
     error.code = 'connection_context_changed';
     error.status = 409;
+    error.requestId = responseRequestId(response);
     throw error;
   }
   const body = await response.json().catch(() => ({ error: { message: 'Invalid server response.' } }));
@@ -745,9 +844,12 @@ async function api(path, options) {
     const error = new Error(typeof apiError.message === 'string' ? apiError.message : 'Request failed.');
     error.code = typeof apiError.code === 'string' ? apiError.code : 'request_failed';
     error.status = response.status;
+    error.requestId = responseRequestId(response);
     throw error;
   }
-  return body;
+  return captureFhirTrace
+    ? { value: body, trace: readFhirResponseTrace(response) }
+    : body;
 }
 
 function isAbortError(error) {
@@ -1110,8 +1212,220 @@ function clearTemporalGraph() {
   temporalGraph.hidden = true;
 }
 
+function resourcesInFhirResponse(value) {
+  if (!value || typeof value !== 'object') return [];
+  if (value.resourceType !== 'Bundle') {
+    return typeof value.resourceType === 'string' ? [value] : [];
+  }
+  if (!Array.isArray(value.entry)) return [];
+  return value.entry.map((entry) =>
+    entry && typeof entry === 'object' && entry.resource && typeof entry.resource === 'object'
+      ? entry.resource
+      : null
+  ).filter(Boolean);
+}
+
+function primaryResourcesInFhirResponse(value) {
+  if (!value || typeof value !== 'object' || value.resourceType !== 'Bundle') {
+    return resourcesInFhirResponse(value);
+  }
+  if (!Array.isArray(value.entry)) return [];
+  return value.entry.map((entry) => {
+    const resource = entry && typeof entry === 'object' ? entry.resource : null;
+    if (!resource || typeof resource !== 'object' || resource.resourceType === 'OperationOutcome') {
+      return null;
+    }
+    if (
+      resource.resourceType === 'Provenance' && entry.search &&
+      typeof entry.search === 'object' && entry.search.mode === 'include'
+    ) return null;
+    return resource;
+  }).filter(Boolean);
+}
+
+function responseHasIncompleteOutcome(value) {
+  return resourcesInFhirResponse(value).some((resource) =>
+    resource.resourceType === 'OperationOutcome' && Array.isArray(resource.issue) &&
+    resource.issue.some((issue) =>
+      issue && typeof issue === 'object' && issue.code === 'incomplete'
+    )
+  );
+}
+
+function renderResponseTrace(value, trace) {
+  currentResponseTrace = { value, trace };
+  fieldCheckPath.value = '';
+  fieldCheckResult.textContent = '';
+  fieldCheckButton.disabled = false;
+
+  const resourceType = trace && typeof trace.resourceType === 'string'
+    ? trace.resourceType
+    : value && typeof value === 'object' && typeof value.resourceType === 'string'
+      ? value.resourceType
+      : 'FHIR';
+  const primaryResources = primaryResourcesInFhirResponse(value);
+  const includedProvenanceCount = value && typeof value === 'object' &&
+      value.resourceType === 'Bundle' && Array.isArray(value.entry)
+    ? value.entry.filter((entry) => {
+        const resource = entry && typeof entry === 'object' ? entry.resource : null;
+        return resource && typeof resource === 'object' && resource.resourceType === 'Provenance' &&
+          entry.search && typeof entry.search === 'object' && entry.search.mode === 'include';
+      }).length
+    : 0;
+  const outcomeCount = resourcesInFhirResponse(value).filter((resource) =>
+    resource.resourceType === 'OperationOutcome'
+  ).length;
+
+  if (trace && trace.source === 'connector-derived') {
+    responseTraceSource.textContent = 'This is not a direct Epic Location search response. The connector searched the authorized patient’s Encounters and then read same-server Location resources referenced by them.';
+  } else if (trace && trace.source === 'epic' && trace.interaction === 'search') {
+    responseTraceSource.textContent = 'Epic returned this ' + resourceType + ' search page under the current patient grant, requested filters, and result count.';
+  } else if (trace && trace.source === 'epic' && trace.interaction === 'read') {
+    responseTraceSource.textContent = 'Epic returned this ' + resourceType + ' resource for the current patient-authorized read.';
+  } else {
+    responseTraceSource.textContent = 'The application did not receive enough safe trace metadata to attest whether this payload is direct or connector-derived.';
+  }
+
+  if (trace && trace.fieldsPreserved) {
+    responseTraceConnector.textContent = 'The connector parsed and validated the FHIR JSON and preserved every field on each returned resource.';
+  } else {
+    responseTraceConnector.textContent = 'Resource-field preservation was not attested for this response, so use the complete application JSON without assuming it is identical to the source payload.';
+  }
+  if (trace && trace.transforms.includes('bundle-links-rewritten')) {
+    responseTraceConnector.textContent += ' It replaced Epic’s Bundle navigation links with a safe, session-bound next-page link; other upstream Bundle links are not exposed.';
+  }
+  if (trace && trace.transforms.includes('derived-from-encounter-references')) {
+    responseTraceConnector.textContent += ' It selected bounded Encounter location references and generated the Bundle shown here.';
+  }
+  if (responseHasIncompleteOutcome(value)) {
+    responseTraceConnector.textContent += ' A processing notice marks this derived result as incomplete; some referenced locations may be unresolved, unavailable, or beyond a safety limit.';
+  }
+
+  const allFieldsExpanded = primaryResources.length > 0 && primaryResources.every((resource) =>
+    resource.resourceType === 'Patient' || resource.resourceType === 'Location'
+  );
+  if (primaryResources.length === 0) {
+    responseTraceDisplay.textContent = 'No primary resource was available to summarize on this response page.';
+  } else if (allFieldsExpanded) {
+    responseTraceDisplay.textContent = 'The readable view expands every top-level field returned for ' +
+      primaryResources.length + ' resource' + (primaryResources.length === 1 ? '' : 's') +
+      '; nested content is rendered as structured text.';
+  } else {
+    responseTraceDisplay.textContent = 'The readable view is a selective summary of ' +
+      primaryResources.length + ' resource' + (primaryResources.length === 1 ? '' : 's') +
+      '. A field can reach the browser but appear only in the complete application JSON below.';
+  }
+  if (includedProvenanceCount > 0 || outcomeCount > 0) {
+    responseTraceDisplay.textContent += ' ' + [
+      includedProvenanceCount > 0
+        ? includedProvenanceCount + ' included Provenance record' + (includedProvenanceCount === 1 ? ' is' : 's are') + ' Advanced-only'
+        : '',
+      outcomeCount > 0
+        ? outcomeCount + ' processing notice' + (outcomeCount === 1 ? ' is' : 's are') + ' summarized rather than shown as a health record'
+        : '',
+    ].filter(Boolean).join('; ') + '.';
+  }
+
+  const statusText = trace && Number.isInteger(trace.status) ? 'HTTP ' + trace.status : '';
+  const requestText = trace && typeof trace.requestId === 'string'
+    ? 'Request reference: ' + trace.requestId + '. Share this reference with support instead of sharing health JSON or a screenshot.'
+    : 'No safe request reference was available for this response.';
+  responseTraceReference.textContent = [statusText, requestText].filter(Boolean).join(' · ');
+  responseTrace.hidden = false;
+  responseTrace.open = false;
+}
+
+function valueContainsFieldName(value, fieldName, state) {
+  if (!value || typeof value !== 'object') return false;
+  if (state.inspected >= 20000) {
+    state.limitReached = true;
+    return false;
+  }
+  state.inspected += 1;
+  if (Array.isArray(value)) {
+    return value.some((item) => valueContainsFieldName(item, fieldName, state));
+  }
+  if (Object.prototype.hasOwnProperty.call(value, fieldName)) return true;
+  return Object.values(value).some((item) => valueContainsFieldName(item, fieldName, state));
+}
+
+function valueContainsFieldPath(value, segments, index, state) {
+  if (value === null || value === undefined) return false;
+  if (state.inspected >= 20000) {
+    state.limitReached = true;
+    return false;
+  }
+  state.inspected += 1;
+  if (Array.isArray(value)) {
+    return value.some((item) => valueContainsFieldPath(item, segments, index, state));
+  }
+  if (typeof value !== 'object' || !Object.prototype.hasOwnProperty.call(value, segments[index])) {
+    return false;
+  }
+  if (index === segments.length - 1) return true;
+  return valueContainsFieldPath(value[segments[index]], segments, index + 1, state);
+}
+
+function resourcesMatchingField(resources, segments) {
+  const matches = [];
+  const state = { inspected: 0, limitReached: false };
+  for (const resource of resources) {
+    const path = segments[0] === resource.resourceType ? segments.slice(1) : segments;
+    if (path.length === 0) {
+      matches.push(resource);
+      continue;
+    }
+    const matched = path.length === 1
+      ? valueContainsFieldName(resource, path[0], state)
+      : valueContainsFieldPath(resource, path, 0, state);
+    if (matched) matches.push(resource);
+  }
+  return { matches, complete: !state.limitReached };
+}
+
+fieldCheckForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!currentResponseTrace || fieldCheckButton.disabled) return;
+  const pathText = fieldCheckPath.value.trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*){0,15}$/.test(pathText)) {
+    fieldCheckResult.textContent = 'Enter a FHIR field name or dot path using letters, numbers, and underscores, with at most 16 path parts.';
+    return;
+  }
+  const segments = pathText.split('.');
+  const resources = resourcesInFhirResponse(currentResponseTrace.value);
+  const fieldSearch = resourcesMatchingField(resources, segments);
+  const matches = fieldSearch.matches;
+  const trace = currentResponseTrace.trace;
+  if (matches.length > 0) {
+    const types = [...new Set(matches.map((resource) => resource.resourceType).filter((value) =>
+      typeof value === 'string'
+    ))].sort();
+    fieldCheckResult.textContent = 'Found “' + pathText + '” in ' +
+      (fieldSearch.complete ? '' : 'at least ') + matches.length + ' returned resource' +
+      (matches.length === 1 ? '' : 's') + (types.length > 0 ? ' (' + types.join(', ') + ')' : '') +
+      '. It reached this browser in the complete application JSON. If it is absent from the friendly view, the UI summary omitted it.';
+    return;
+  }
+  if (!fieldSearch.complete) {
+    fieldCheckResult.textContent = '“' + pathText + '” was not found before the safe in-browser inspection limit was reached. Search the complete application JSON below; this bounded check cannot classify the field as absent.';
+    return;
+  }
+  if (!trace || trace.fieldsPreserved !== true) {
+    fieldCheckResult.textContent = '“' + pathText + '” is not present in the application response. Because field-preservation trace metadata is unavailable, this view cannot determine where it was lost.';
+  } else if (trace.source === 'epic' && trace.interaction === 'read') {
+    fieldCheckResult.textContent = '“' + pathText + '” is not present. The connector preserved returned resource fields, so Epic did not include this field or path in this read response.';
+  } else if (trace.source === 'epic' && trace.interaction === 'search') {
+    fieldCheckResult.textContent = '“' + pathText + '” is not present in any resource on this Epic search page. The connector preserved returned resource fields, but filters, the current grant, result limits, or another page may still affect what Epic returned.';
+  } else if (trace.source === 'connector-derived') {
+    fieldCheckResult.textContent = '“' + pathText + '” is not present in this connector-derived response. Because only bounded, Encounter-referenced Locations were fetched, this does not prove that Epic lacks the field or another Location.';
+  } else {
+    fieldCheckResult.textContent = '“' + pathText + '” is not present in the application response. The source mode was not safely attested, so this view cannot determine whether the field was absent upstream or transformed before display.';
+  }
+});
+
 function clearDataDisplay(message = 'No health data loaded.') {
   currentDataView = null;
+  currentResponseTrace = null;
   copyRequestSequence += 1;
   copyResourcesButton.disabled = true;
   copyResourcesStatus.textContent = '';
@@ -1120,6 +1434,15 @@ function clearDataDisplay(message = 'No health data loaded.') {
   resultList.replaceChildren();
   resultList.hidden = true;
   activeResultButtons = [];
+  responseTraceSource.textContent = '';
+  responseTraceConnector.textContent = '';
+  responseTraceDisplay.textContent = '';
+  responseTraceReference.textContent = '';
+  fieldCheckPath.value = '';
+  fieldCheckResult.textContent = '';
+  fieldCheckButton.disabled = true;
+  responseTrace.hidden = true;
+  responseTrace.open = false;
   advancedResult.hidden = true;
   advancedResult.open = false;
   resultError.textContent = '';
@@ -2482,7 +2805,7 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
     semanticsWarning.textContent = 'This ' + friendlyResourceName(resource.resourceType) +
       ' resource has semantics this app has not interpreted, such as modifier extensions or implicit rules, ' +
       'or was too complex to fully assess. All source fields are displayed, but consult the applicable ' +
-      'definitions and raw FHIR JSON before relying on their meaning.';
+      'definitions and the complete application FHIR JSON before relying on their meaning.';
     card.append(semanticsWarning);
   }
   if (resource.resourceType === 'Patient' && !isTimelineCard) {
@@ -2606,13 +2929,14 @@ function renderFriendlyResult(value) {
   };
 }
 
-function showResult(value, label, pageNumber, previousView) {
-  currentDataView = { value, label, pageNumber };
+function showResult(value, label, pageNumber, previousView, trace) {
+  currentDataView = { value, label, pageNumber, trace };
   copyRequestSequence += 1;
   copyResourcesStatus.textContent = '';
   result.textContent = JSON.stringify(value, null, 2);
   copyResourcesButton.disabled = false;
   const friendlySummary = renderFriendlyResult(value);
+  renderResponseTrace(value, trace);
   advancedResult.hidden = false;
   advancedResult.open = false;
   resultError.textContent = '';
@@ -2631,8 +2955,8 @@ function showResult(value, label, pageNumber, previousView) {
       (friendlySummary.provenanceCount === 1 ? '' : 's') + '.'
     : '';
   const displayDescription = value && typeof value === 'object' && value.resourceType === 'Patient'
-    ? ' Every field returned by Epic is shown below; complete parsed FHIR JSON remains available in Advanced.'
-    : ' A readable summary is shown below; raw FHIR JSON remains available in Advanced.';
+    ? ' Every field returned by Epic is shown below; complete application FHIR JSON remains available in Advanced.'
+    : ' A readable summary is shown below; complete application FHIR JSON remains available in Advanced.';
   resultStatus.textContent = label + ' loaded.' + pageDescription + outcomeDescription + provenanceDescription +
     displayDescription;
   paginationControls.replaceChildren();
@@ -2642,7 +2966,7 @@ function showResult(value, label, pageNumber, previousView) {
     backButton.className = 'secondary';
     backButton.textContent = 'Back to search results';
     backButton.addEventListener('click', () => {
-      showResult(previousView.value, previousView.label, previousView.pageNumber);
+      showResult(previousView.value, previousView.label, previousView.pageNumber, undefined, previousView.trace);
     });
     activeResultButtons.push(backButton);
     paginationControls.append(backButton);
@@ -2682,10 +3006,10 @@ copyResourcesButton.addEventListener('click', async () => {
     }
     await navigator.clipboard.writeText(text);
     if (requestSequence !== copyRequestSequence || result.textContent !== text) return;
-    copyResourcesStatus.textContent = 'Raw FHIR JSON copied to your clipboard.';
+    copyResourcesStatus.textContent = 'Application FHIR JSON copied to your clipboard.';
   } catch {
     if (requestSequence !== copyRequestSequence || result.textContent !== text) return;
-    copyResourcesStatus.textContent = 'Could not copy. Select the raw JSON and copy it manually.';
+    copyResourcesStatus.textContent = 'Could not copy. Select the application JSON and copy it manually.';
   } finally {
     if (requestSequence === copyRequestSequence) {
       copyResourcesButton.disabled = result.textContent.length === 0;
@@ -2693,9 +3017,25 @@ copyResourcesButton.addEventListener('click', async () => {
   }
 });
 
+function apiErrorMessage(error, fallback) {
+  const message = error instanceof Error ? error.message : fallback;
+  if (!error || typeof error !== 'object') return message;
+  const references = [];
+  if (Number.isInteger(error.status) && error.status >= 400 && error.status <= 599) {
+    references.push('HTTP ' + error.status);
+  }
+  if (typeof error.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(error.code)) {
+    references.push('error ' + error.code);
+  }
+  if (typeof error.requestId === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(error.requestId)) {
+    references.push('request ' + error.requestId);
+  }
+  return references.length > 0 ? message + ' Support details: ' + references.join(' · ') + '.' : message;
+}
+
 function showApiError(error) {
   clearDataDisplay('No health data is displayed.');
-  resultError.textContent = error instanceof Error ? error.message : 'The health-data request failed.';
+  resultError.textContent = apiErrorMessage(error, 'The health-data request failed.');
   resultError.hidden = false;
   resultError.focus();
 }
@@ -2951,15 +3291,16 @@ async function runDataRequest(path, label, pageNumber, options) {
   explorer.setAttribute('aria-busy', 'true');
   setDataControlsDisabled(true);
   try {
-    const value = await api(path, {
+    const response = await api(path, {
       signal: controller.signal,
       expectedConnectionContext: expectedConnectionKey,
+      captureFhirTrace: true,
     });
     if (
       requestSequence !== dataRequestSequence ||
       expectedConnectionKey !== currentConnectionKey
     ) return;
-    showResult(value, label, pageNumber, previousView);
+    showResult(response.value, label, pageNumber, previousView, response.trace);
   } catch (error) {
     if (
       requestSequence !== dataRequestSequence ||
@@ -2971,7 +3312,7 @@ async function runDataRequest(path, label, pageNumber, options) {
       await refreshStatus();
     } else if (previousView) {
       resultStatus.textContent = 'The detail request failed; the previous search results remain below.';
-      resultError.textContent = error instanceof Error ? error.message : 'The health-data request failed.';
+      resultError.textContent = apiErrorMessage(error, 'The health-data request failed.');
       resultError.hidden = false;
       resultError.focus();
     } else {

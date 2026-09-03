@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildApp } from "../src/app.js";
 import type { AuditEvent } from "../src/audit.js";
 import { InMemoryFhirHubRepository } from "../src/fhir-hub.js";
-import type { FetchLike } from "../src/types.js";
+import { InMemoryConnectionStore } from "../src/store.js";
+import type { ConnectionRecord, FetchLike } from "../src/types.js";
 import { jsonResponse, makeConfig } from "./helpers.js";
 
 const openApps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
@@ -48,6 +49,26 @@ function consentRequest(config: ReturnType<typeof makeConfig>): {
       policyVersion: config.consentPolicyVersion,
     }).toString(),
   };
+}
+
+function expectFhirTrace(
+  headers: Record<string, string | string[] | undefined>,
+  expected: {
+    readonly source: "epic" | "connector-derived";
+    readonly interaction: "read" | "search";
+    readonly resourceType: string;
+    readonly transforms: string;
+  },
+): void {
+  expect(Object.fromEntries(
+    Object.entries(headers).filter(([name]) => name.startsWith("x-moonba-fhir-")),
+  )).toEqual({
+    "x-moonba-fhir-source": expected.source,
+    "x-moonba-fhir-interaction": expected.interaction,
+    "x-moonba-fhir-resource-type": expected.resourceType,
+    "x-moonba-fhir-resource-fields": "preserved",
+    "x-moonba-fhir-transforms": expected.transforms,
+  });
 }
 
 afterEach(async () => {
@@ -142,6 +163,195 @@ describe("HTTP application", () => {
     expect(event).toBeDefined();
     expect(event?.resourceType).toBeUndefined();
     expect(JSON.stringify(event)).not.toContain("private-health-note");
+  });
+
+  it("describes successful FHIR response processing with bounded, non-sensitive headers", async () => {
+    const resourceScopes =
+      "patient/Patient.r patient/Condition.rs patient/Encounter.s patient/Location.r";
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_TYPES: "Condition,Encounter,Location",
+      EPIC_ALLOWED_RESOURCE_SCOPES: resourceScopes,
+    });
+    const now = Date.now();
+    const sessionId = "t".repeat(43);
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    const record: ConnectionRecord = {
+      oauthClientId: config.clientId,
+      tokenAuthMethod: config.tokenAuthMethod,
+      fhirBaseUrl: config.fhirBaseUrl,
+      tokenEndpoint: "https://ehr.example.test/token",
+      accessToken: "private-access-token",
+      tokenType: "Bearer",
+      expiresAt: now + 60 * 60 * 1_000,
+      scope: resourceScopes,
+      patientId: "patient-private",
+      oidcIssuer: "https://ehr.example.test/oauth2",
+      oidcSubject: "account-private",
+      consent: {
+        policyVersion: config.consentPolicyVersion,
+        acceptedAt: now - 1_000,
+        purpose: "patient-access",
+        requestedScopes: [...config.scopes],
+        allowedResourceScopes: [...config.allowedResourceScopes],
+      },
+      fhirCapabilities: [{
+        resourceType: "Patient",
+        interactions: ["read"],
+        searchParameters: [],
+      }, {
+        resourceType: "Condition",
+        interactions: ["read", "search"],
+        searchParameters: ["patient", "status"],
+      }, {
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+      connectedAt: now - 1_000,
+      lastAccessAt: now - 1_000,
+      sessionExpiresAt: now + 60 * 60 * 1_000,
+    };
+    await store.set(sessionId, record);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private-access-token");
+      const upstream = new URL(input.toString());
+      if (upstream.pathname.endsWith("/Patient/patient-private")) {
+        return jsonResponse({ resourceType: "Patient", id: "patient-private" });
+      }
+      if (upstream.pathname.endsWith("/Condition/condition-private")) {
+        return jsonResponse({ resourceType: "Condition", id: "condition-private" });
+      }
+      if (upstream.pathname.endsWith("/Condition")) {
+        if (upstream.searchParams.get("page") === "2") {
+          return jsonResponse({ resourceType: "Bundle", type: "searchset", link: [] });
+        }
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          link: [{
+            relation: "next",
+            url: `${config.fhirBaseUrl}/Condition?status=active&patient=patient-private&page=2`,
+          }],
+        });
+      }
+      if (upstream.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-private",
+              location: [{ location: { reference: "Location/location-private" } }],
+            },
+          }],
+        });
+      }
+      if (upstream.pathname.endsWith("/Location/location-private")) {
+        return jsonResponse({ resourceType: "Location", id: "location-private" });
+      }
+      throw new Error(`Unexpected fetch: ${upstream.origin}${upstream.pathname}`);
+    });
+    const app = await buildApp(config, {
+      store,
+      fetch: fetchMock as FetchLike,
+      enablePruneTimer: false,
+    });
+    openApps.push(app);
+
+    const cookie = `${config.cookieName}=${app.signCookie(sessionId)}`;
+    const connection = await app.inject({
+      method: "GET",
+      url: "/api/connection",
+      headers: { cookie },
+    });
+    const connectionContext = connection.json().connectionContext as string;
+    const headers = {
+      cookie,
+      "x-epic-expected-connection-context": connectionContext,
+    };
+
+    const patient = await app.inject({ method: "GET", url: "/api/patient", headers });
+    expect(patient.statusCode).toBe(200);
+    expectFhirTrace(patient.headers, {
+      source: "epic",
+      interaction: "read",
+      resourceType: "Patient",
+      transforms: "json-parsed,validated",
+    });
+
+    const read = await app.inject({
+      method: "GET",
+      url: "/api/fhir/Condition/condition-private",
+      headers,
+    });
+    expect(read.statusCode).toBe(200);
+    expectFhirTrace(read.headers, {
+      source: "epic",
+      interaction: "read",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated",
+    });
+
+    const search = await app.inject({
+      method: "GET",
+      url: "/api/fhir/Condition?status=active&_count=1",
+      headers,
+    });
+    expect(search.statusCode).toBe(200);
+    expectFhirTrace(search.headers, {
+      source: "epic",
+      interaction: "search",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated,bundle-links-rewritten",
+    });
+
+    const nextPath = search.json().link[0].url as string;
+    const page = await app.inject({ method: "GET", url: nextPath, headers });
+    expect(page.statusCode).toBe(200);
+    expectFhirTrace(page.headers, {
+      source: "epic",
+      interaction: "search",
+      resourceType: "Condition",
+      transforms: "json-parsed,validated,bundle-links-rewritten",
+    });
+
+    const locations = await app.inject({
+      method: "GET",
+      url: "/api/fhir/Location?_count=1",
+      headers,
+    });
+    expect(locations.statusCode).toBe(200);
+    expectFhirTrace(locations.headers, {
+      source: "connector-derived",
+      interaction: "search",
+      resourceType: "Location",
+      transforms:
+        "json-parsed,validated,derived-from-encounter-references,bundle-generated",
+    });
+
+    const traceValues = [patient, read, search, page, locations]
+      .flatMap((response) => Object.entries(response.headers))
+      .filter(([name]) => name.startsWith("x-moonba-fhir-"))
+      .map(([, value]) => String(value))
+      .join("|");
+    expect(traceValues).not.toContain("private");
+    expect(traceValues).not.toContain(config.fhirBaseUrl);
+    expect(traceValues).not.toContain("status=active");
+
+    const invalidPage = await app.inject({
+      method: "GET",
+      url: "/api/fhir-page?cursor=",
+      headers,
+    });
+    expect(invalidPage.statusCode).toBe(400);
+    expect(Object.keys(invalidPage.headers)).not.toContain("x-moonba-fhir-source");
   });
 
   it("rejects missing, forged, and stale consent before creating a session or contacting Epic", async () => {
