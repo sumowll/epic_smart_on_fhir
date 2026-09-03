@@ -440,6 +440,52 @@ describe("Epic connector production controls", () => {
     }
   });
 
+  it("advertises Care locations only when Encounter search and Location read can derive them", async () => {
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_SCOPES: "patient/Encounter.s patient/Location.r patient/Location.s",
+      EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location",
+    });
+    const serverCapabilities: ConnectionRecord["fhirCapabilities"] = [{
+      resourceType: "Encounter",
+      interactions: ["search"],
+      searchParameters: ["patient", "_count"],
+    }, {
+      resourceType: "Location",
+      interactions: ["read"],
+      searchParameters: [],
+    }];
+
+    for (const [scope, expected] of [
+      ["patient/Encounter.s patient/Location.r", true],
+      ["patient/Location.r patient/Location.s", false],
+      ["patient/Encounter.s patient/Location.s", false],
+    ] as const) {
+      const store = new InMemoryConnectionStore();
+      const service = new EpicConnectorService(config, store, { now: () => now });
+      await service.initialize(false);
+      await store.set(sessionA, connection(config, `account-${expected}-${scope.length}`, {
+        scope,
+        fhirCapabilities: serverCapabilities,
+      }));
+      try {
+        const summary = await service.getConnectionSummary(sessionA);
+        const location = summary.capabilities?.find(({ resourceType }) =>
+          resourceType === "Location");
+        expect(location?.search ?? false).toBe(expected);
+        if (expected) {
+          expect(location).toMatchObject({
+            resourceType: "Location",
+            read: true,
+            search: true,
+            searchConstraints: [],
+          });
+        }
+      } finally {
+        await service.close();
+      }
+    }
+  });
+
   it("prunes an idle-expired connection before its absolute session lifetime", async () => {
     const config = makeConfig();
     const store = new InMemoryConnectionStore();

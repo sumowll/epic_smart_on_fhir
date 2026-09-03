@@ -4,6 +4,7 @@ import {
   assertSmartReadResourceAuthorized,
   authorizeSmartSearchWithContext,
   authorizedSmartReadGrants,
+  authorizedSmartSearchGrants,
   parseSmartScopes,
   type SmartScopeConstraint,
 } from "./smart-scopes.js";
@@ -34,6 +35,20 @@ export function isUserControllableSearchParameter(name: string): boolean {
 
 const fhirIdPattern = /^[A-Za-z0-9\-.]{1,64}$/;
 const provenanceReverseInclude = "Provenance:target";
+const encounterLocationPageCount = 100;
+const encounterLocationPageLimit = 10;
+const encounterLocationReadLimit = 100;
+const locationReadConcurrency = 4;
+const encounterLocationOperationLimitMs = 30_000;
+const encounterLocationUpstreamByteMultiplier = 2;
+const encounterLocationOutcomeLimit = 20;
+const derivedBundleOverheadBytes = 2_048;
+
+interface FhirRequestLimits {
+  readonly timeoutMs?: number;
+  readonly maxBytes?: number;
+  readonly consumeBytes?: (byteLength: number) => boolean;
+}
 
 type ResourceSearchStrategy = "patient" | "scope-restricted" | "reference-only";
 
@@ -48,7 +63,8 @@ export interface FhirSearchResult {
  * search parameter. Supporting resources are searched only under the server's
  * patient-level SMART authorization and must never receive an invalid generic
  * `patient=` parameter. Binary is resolved by an authorized instance read from
- * a DocumentReference rather than listed as a standalone search.
+ * a DocumentReference rather than listed as a standalone search. Location is
+ * handled separately by deriving references from patient-bound Encounters.
  */
 const resourceSearchStrategies: Readonly<Record<string, ResourceSearchStrategy>> = {
   AllergyIntolerance: "patient",
@@ -62,7 +78,6 @@ const resourceSearchStrategies: Readonly<Record<string, ResourceSearchStrategy>>
   Encounter: "patient",
   Goal: "patient",
   Immunization: "patient",
-  Location: "scope-restricted",
   Medication: "scope-restricted",
   MedicationRequest: "patient",
   Observation: "patient",
@@ -229,6 +244,150 @@ function validateSearchBundle(
   return bundle;
 }
 
+function nextSearchPageUrl(bundle: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(bundle.link)) return undefined;
+  for (const candidate of bundle.link) {
+    const link = requireObject(candidate);
+    if (link?.relation === "next" && typeof link.url === "string") return link.url;
+  }
+  return undefined;
+}
+
+function locationIdFromEncounterReference(
+  reference: string,
+  fhirBaseUrl: string,
+): string | undefined {
+  const relative = /^Location\/([A-Za-z0-9\-.]{1,64})$/.exec(reference);
+  if (relative) return relative[1];
+
+  try {
+    const absolute = new URL(reference);
+    const base = new URL(`${fhirBaseUrl.replace(/\/+$/, "")}/`);
+    if (
+      absolute.protocol !== base.protocol ||
+      absolute.origin !== base.origin ||
+      absolute.username ||
+      absolute.password ||
+      absolute.search ||
+      absolute.hash
+    ) {
+      return undefined;
+    }
+    const expectedPrefix = `${base.pathname}Location/`;
+    if (!absolute.pathname.startsWith(expectedPrefix)) return undefined;
+    const id = absolute.pathname.slice(expectedPrefix.length);
+    return fhirIdPattern.test(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface EncounterLocationScan {
+  readonly unresolvedReferences: number;
+  readonly additionalLocations: boolean;
+  readonly outcomeEntries: readonly Record<string, unknown>[];
+}
+
+function collectEncounterLocationIds(
+  bundle: Record<string, unknown>,
+  fhirBaseUrl: string,
+  ids: string[],
+  seenIds: Set<string>,
+  limit: number,
+): EncounterLocationScan {
+  let unresolvedReferences = 0;
+  let additionalLocations = false;
+  const outcomeEntries: Record<string, unknown>[] = [];
+  if (!Array.isArray(bundle.entry)) {
+    return { unresolvedReferences, additionalLocations, outcomeEntries };
+  }
+
+  for (const candidate of bundle.entry) {
+    const entry = requireObject(candidate);
+    const resource = requireObject(entry?.resource);
+    if (!entry || !resource) continue;
+    if (resource.resourceType === "OperationOutcome") {
+      outcomeEntries.push({
+        resource,
+        search: { mode: "outcome" },
+      });
+      continue;
+    }
+    if (resource.resourceType !== "Encounter" || !Array.isArray(resource.location)) continue;
+
+    for (const candidateLocation of resource.location) {
+      const encounterLocation = requireObject(candidateLocation);
+      const reference = requireObject(encounterLocation?.location)?.reference;
+      const id = typeof reference === "string"
+        ? locationIdFromEncounterReference(reference, fhirBaseUrl)
+        : undefined;
+      if (!id) {
+        unresolvedReferences += 1;
+        continue;
+      }
+      if (seenIds.has(id)) continue;
+      if (ids.length >= limit) {
+        additionalLocations = true;
+        continue;
+      }
+      seenIds.add(id);
+      ids.push(id);
+    }
+  }
+
+  return { unresolvedReferences, additionalLocations, outcomeEntries };
+}
+
+async function mapWithConcurrency<T, U>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<U>,
+): Promise<U[]> {
+  const output = new Array<U>(values.length);
+  let nextIndex = 0;
+  let failed = false;
+  let failure: unknown;
+  const worker = async (): Promise<void> => {
+    while (!failed && nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        output[index] = await mapper(values[index]!);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+  );
+  if (failed) throw failure;
+  return output;
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function incompleteLocationOutcome(): Record<string, unknown> {
+  return {
+    resource: {
+      resourceType: "OperationOutcome",
+      issue: [{
+        severity: "warning",
+        code: "incomplete",
+        details: {
+          text: "Some care locations referenced by the patient's Encounters could not be returned. The displayed results may be incomplete.",
+        },
+      }],
+    },
+    search: { mode: "outcome" },
+  };
+}
+
 function parseRetryAfterSeconds(response: Response): number | undefined {
   const value = response.headers.get("retry-after")?.trim();
   if (!value) return undefined;
@@ -251,6 +410,35 @@ export class EpicRateLimitError extends AppError {
         : `Epic is rate limiting requests. Please try again in ${retryAfterSeconds} seconds.`,
     );
     this.name = "EpicRateLimitError";
+  }
+}
+
+function fhirStatusError(
+  response: Response,
+  json: unknown,
+  resourceType: string,
+  interaction: "read" | "search",
+): AppError {
+  switch (response.status) {
+    case 400:
+    case 422:
+      return new AppError(
+        response.status,
+        hasOperationOutcomeIssue(json) ? "fhir_request_rejected" : "fhir_invalid_request",
+        interaction === "search"
+          ? `Epic rejected the ${resourceType} search parameters.`
+          : `Epic rejected the ${resourceType} read request.`,
+      );
+    case 401:
+      return new ReconnectRequiredError();
+    case 403:
+      return forbiddenError(response, json, resourceType, interaction);
+    case 404:
+      return new AppError(404, "fhir_resource_not_found", "The requested FHIR resource was not found.");
+    case 429:
+      return new EpicRateLimitError(parseRetryAfterSeconds(response));
+    default:
+      return new UpstreamError("fhir_request_failed", "The FHIR request failed.", response.status);
   }
 }
 
@@ -368,6 +556,15 @@ export class EpicFhirClient {
     resourceType: string,
     id: string,
   ): Promise<unknown> {
+    return this.readWithLimits(record, resourceType, id);
+  }
+
+  private async readWithLimits(
+    record: ConnectionRecord,
+    resourceType: string,
+    id: string,
+    requestLimits?: FhirRequestLimits,
+  ): Promise<unknown> {
     this.requireAllowedType(resourceType);
     if (resourceType === "Binary") {
       throw new AppError(
@@ -384,6 +581,7 @@ export class EpicFhirClient {
       `${resourceType}/${encodeURIComponent(resourceId)}`,
       resourceType,
       "read",
+      requestLimits,
     );
     const resource = validateReadResource(json, resourceType, resourceId);
     assertSmartReadResourceAuthorized(resourceType, resource, grants);
@@ -402,6 +600,20 @@ export class EpicFhirClient {
     record: ConnectionRecord,
     resourceType: string,
     input: URLSearchParams,
+  ): Promise<FhirSearchResult> {
+    this.requireAllowedType(resourceType);
+    if (resourceType === "Location") {
+      return this.searchEncounterLocationsWithContext(record, input);
+    }
+    return this.searchDirectWithContext(record, resourceType, input, true);
+  }
+
+  private async searchDirectWithContext(
+    record: ConnectionRecord,
+    resourceType: string,
+    input: URLSearchParams,
+    allowProvenance: boolean,
+    requestLimits?: FhirRequestLimits,
   ): Promise<FhirSearchResult> {
     this.requireAllowedType(resourceType);
     const capability = this.requireFhirCapability(record, resourceType, "search");
@@ -441,7 +653,7 @@ export class EpicFhirClient {
         `The connected Epic R4 endpoint does not advertise the parameters required for ${resourceType} search.`,
       );
     }
-    const includeProvenance = this.supportsProvenanceReverseInclude(
+    const includeProvenance = allowProvenance && this.supportsProvenanceReverseInclude(
       record,
       resourceType,
       capability,
@@ -454,11 +666,309 @@ export class EpicFhirClient {
       `${resourceType}?${authorization.parameters.toString()}`,
       resourceType,
       "search",
+      requestLimits,
     );
     return {
       bundle: validateSearchBundle(json, resourceType, includeProvenance, record.fhirBaseUrl),
       constraints: authorization.constraints,
       includeProvenance,
+    };
+  }
+
+  private async searchEncounterLocationsWithContext(
+    record: ConnectionRecord,
+    input: URLSearchParams,
+  ): Promise<FhirSearchResult> {
+    const parameters = sanitizeSearchParameters(input);
+    const countValues = parameters.getAll("_count");
+    if (
+      countValues.length !== 1 ||
+      [...parameters.keys()].some((name) => name !== "_count")
+    ) {
+      throw new AppError(
+        400,
+        "location_search_filter_not_supported",
+        "Care locations are derived from the patient's Encounters and accept only the Count option.",
+      );
+    }
+    const requestedLocationCount = Number(countValues[0]);
+
+    this.requireAllowedType("Encounter");
+    this.requireFhirCapability(record, "Location", "read");
+    const encounterCapability = this.requireFhirCapability(record, "Encounter", "search");
+    if (!serverSupportsSmartSearch("Encounter", encounterCapability.searchParameters)) {
+      throw new AppError(
+        409,
+        "fhir_search_parameter_unavailable",
+        "The connected Epic R4 endpoint does not advertise the patient parameter required to derive care locations from Encounters.",
+      );
+    }
+    const encounterGrants = authorizedSmartSearchGrants(record.scope, "Encounter");
+    const locationGrants = authorizedSmartReadGrants(record.scope, "Location");
+    if (
+      !encounterGrants.some((grant) => grant.constraints.length === 0) ||
+      !locationGrants.some((grant) => grant.constraints.length === 0)
+    ) {
+      throw new AppError(
+        403,
+        "fhir_scope_denied",
+        "Deriving care locations requires unrestricted Encounter search and Location read permission in the current MyChart grant.",
+      );
+    }
+
+    const operationDeadline = Date.now() + encounterLocationOperationLimitMs;
+    let remainingUpstreamBytes = this.config.maxUpstreamBytes *
+      encounterLocationUpstreamByteMultiplier;
+    const runWithUpstreamReservation = async <T>(
+      maxReservationBytes: number,
+      operation: (limits: FhirRequestLimits) => Promise<T>,
+    ): Promise<T> => {
+      const reservedBytes = Math.min(
+        Math.max(0, maxReservationBytes),
+        remainingUpstreamBytes,
+      );
+      remainingUpstreamBytes -= reservedBytes;
+      let unconsumedReservedBytes = reservedBytes;
+      try {
+        return await operation({
+          timeoutMs: Math.max(
+            1,
+            Math.min(this.config.requestTimeoutMs, operationDeadline - Date.now()),
+          ),
+          consumeBytes: (byteLength) => {
+            if (byteLength > unconsumedReservedBytes) {
+              unconsumedReservedBytes = 0;
+              return false;
+            }
+            unconsumedReservedBytes -= byteLength;
+            return true;
+          },
+        });
+      } finally {
+        remainingUpstreamBytes += unconsumedReservedBytes;
+      }
+    };
+    const sourceSearch = await runWithUpstreamReservation(
+      this.config.maxUpstreamBytes,
+      (limits) => this.searchDirectWithContext(
+        record,
+        "Encounter",
+        new URLSearchParams({ _count: String(encounterLocationPageCount) }),
+        false,
+        limits,
+      ),
+    );
+    let sourceBundle = requireObject(sourceSearch.bundle)!;
+    const locationIds: string[] = [];
+    const seenLocationIds = new Set<string>();
+    const outcomeEntries: Record<string, unknown>[] = [];
+    const locationEntries: Record<string, unknown>[] = [];
+    let unresolvedReferences = 0;
+    let unavailableLocations = 0;
+    let resultLimitReached = false;
+    let sourcePageLimitReached = false;
+    let locationReadLimitReached = false;
+    let operationLimitReached = false;
+    let upstreamByteLimitReached = false;
+    let outputLimitReached = false;
+    let outcomeLimitReached = false;
+    let nextLocationIndex = 0;
+    let locationReadCount = 0;
+    let outputBytes = derivedBundleOverheadBytes;
+    let outcomeBytes = 0;
+    let pageNumber = 1;
+
+    while (true) {
+      const scan = collectEncounterLocationIds(
+        sourceBundle,
+        record.fhirBaseUrl,
+        locationIds,
+        seenLocationIds,
+        encounterLocationReadLimit,
+      );
+      unresolvedReferences += scan.unresolvedReferences;
+      locationReadLimitReached ||= scan.additionalLocations;
+      for (const outcomeEntry of scan.outcomeEntries) {
+        const entryBytes = jsonByteLength(outcomeEntry);
+        const outcomeByteLimit = Math.floor(this.config.maxUpstreamBytes / 4);
+        if (
+          outcomeEntries.length >= encounterLocationOutcomeLimit ||
+          outcomeBytes + entryBytes > outcomeByteLimit ||
+          outputBytes + entryBytes > this.config.maxUpstreamBytes
+        ) {
+          outcomeLimitReached = true;
+          continue;
+        }
+        outcomeEntries.push(outcomeEntry);
+        outcomeBytes += entryBytes;
+        outputBytes += entryBytes;
+      }
+      const nextUrl = nextSearchPageUrl(sourceBundle);
+
+      while (
+        nextLocationIndex < locationIds.length &&
+        locationEntries.length < requestedLocationCount &&
+        locationReadCount < encounterLocationReadLimit
+      ) {
+        if (Date.now() >= operationDeadline) {
+          operationLimitReached = true;
+          break;
+        }
+        if (remainingUpstreamBytes === 0) {
+          upstreamByteLimitReached = true;
+          break;
+        }
+        const batchSize = Math.min(
+          locationReadConcurrency,
+          requestedLocationCount - locationEntries.length,
+          locationIds.length - nextLocationIndex,
+          encounterLocationReadLimit - locationReadCount,
+        );
+        const batchIds = locationIds.slice(nextLocationIndex, nextLocationIndex + batchSize);
+        nextLocationIndex += batchIds.length;
+        locationReadCount += batchIds.length;
+        const maxReservationPerRead = Math.floor(remainingUpstreamBytes / batchIds.length);
+        const resolvedBatch = await mapWithConcurrency(
+          batchIds,
+          locationReadConcurrency,
+          async (id): Promise<Record<string, unknown> | undefined> => {
+            try {
+              return requireObject(await runWithUpstreamReservation(
+                maxReservationPerRead,
+                (limits) => this.readWithLimits(record, "Location", id, limits),
+              ));
+            } catch (error) {
+              if (
+                error instanceof AppError &&
+                (error.code === "fhir_resource_not_found" || error.code === "fhir_access_denied")
+              ) {
+                unavailableLocations += 1;
+                return undefined;
+              }
+              if (
+                error instanceof UpstreamError &&
+                error.code === "upstream_byte_budget_exceeded" &&
+                error.upstreamStatus === 200
+              ) {
+                upstreamByteLimitReached = true;
+                return undefined;
+              }
+              if (
+                error instanceof UpstreamError &&
+                error.code === "upstream_unavailable" &&
+                Date.now() >= operationDeadline
+              ) {
+                operationLimitReached = true;
+                return undefined;
+              }
+              throw error;
+            }
+          },
+        );
+        for (let index = 0; index < resolvedBatch.length; index += 1) {
+          const resource = resolvedBatch[index];
+          if (!resource) continue;
+          const entry = {
+            fullUrl: `${record.fhirBaseUrl.replace(/\/+$/, "")}/Location/${encodeURIComponent(batchIds[index]!)}`,
+            resource,
+            search: { mode: "match" },
+          };
+          const entryBytes = jsonByteLength(entry);
+          if (outputBytes + entryBytes > this.config.maxUpstreamBytes) {
+            outputLimitReached = true;
+            break;
+          }
+          outputBytes += entryBytes;
+          locationEntries.push(entry);
+        }
+        if (outputLimitReached || upstreamByteLimitReached || operationLimitReached) break;
+      }
+
+      if (locationEntries.length >= requestedLocationCount) {
+        resultLimitReached = nextLocationIndex < locationIds.length ||
+          scan.additionalLocations ||
+          nextUrl !== undefined;
+        break;
+      }
+      if (operationLimitReached || upstreamByteLimitReached || outputLimitReached) break;
+      if (locationReadCount >= encounterLocationReadLimit) {
+        locationReadLimitReached = nextLocationIndex < locationIds.length ||
+          scan.additionalLocations ||
+          nextUrl !== undefined;
+        break;
+      }
+      if (!nextUrl) break;
+      if (Date.now() >= operationDeadline) {
+        operationLimitReached = true;
+        break;
+      }
+      if (remainingUpstreamBytes === 0) {
+        upstreamByteLimitReached = true;
+        break;
+      }
+      if (pageNumber >= encounterLocationPageLimit) {
+        sourcePageLimitReached = true;
+        break;
+      }
+      pageNumber += 1;
+      try {
+        sourceBundle = requireObject(await runWithUpstreamReservation(
+          this.config.maxUpstreamBytes,
+          (limits) => this.page(
+            record,
+            "Encounter",
+            nextUrl,
+            sourceSearch.constraints,
+            false,
+            limits,
+          ),
+        ))!;
+      } catch (error) {
+        if (
+          error instanceof UpstreamError &&
+          error.code === "upstream_byte_budget_exceeded" &&
+          error.upstreamStatus === 200
+        ) {
+          upstreamByteLimitReached = true;
+          break;
+        }
+        if (
+          error instanceof UpstreamError &&
+          error.code === "upstream_unavailable" &&
+          Date.now() >= operationDeadline
+        ) {
+          operationLimitReached = true;
+          break;
+        }
+        throw error;
+      }
+    }
+
+    const partial = unresolvedReferences > 0 ||
+      unavailableLocations > 0 ||
+      resultLimitReached ||
+      sourcePageLimitReached ||
+      locationReadLimitReached ||
+      operationLimitReached ||
+      upstreamByteLimitReached ||
+      outputLimitReached ||
+      outcomeLimitReached;
+    const entry = [
+      ...locationEntries,
+      ...outcomeEntries,
+      ...(partial ? [incompleteLocationOutcome()] : []),
+    ];
+    const bundle = {
+      resourceType: "Bundle",
+      type: "searchset",
+      ...(!partial && outcomeEntries.length === 0 ? { total: locationEntries.length } : {}),
+      link: [],
+      entry,
+    };
+    return {
+      bundle: validateSearchBundle(bundle, "Location", false, record.fhirBaseUrl),
+      constraints: [],
+      includeProvenance: false,
     };
   }
 
@@ -468,6 +978,7 @@ export class EpicFhirClient {
     nextUrl: string,
     constraints: readonly SmartScopeConstraint[] = [],
     includeProvenance = false,
+    requestLimits?: FhirRequestLimits,
   ): Promise<unknown> {
     this.requireAllowedType(resourceType);
     const capability = this.requireFhirCapability(record, resourceType, "search");
@@ -521,7 +1032,7 @@ export class EpicFhirClient {
       constraints,
       includeProvenance,
     );
-    const json = await this.getUrl(record, url, resourceType, "search");
+    const json = await this.getUrl(record, url, resourceType, "search", requestLimits);
     return validateSearchBundle(json, resourceType, includeProvenance, record.fhirBaseUrl);
   }
 
@@ -683,6 +1194,7 @@ export class EpicFhirClient {
     relativePath: string,
     resourceType: string,
     interaction: "read" | "search",
+    requestLimits?: FhirRequestLimits,
   ): Promise<unknown> {
     if (record.fhirBaseUrl !== this.config.fhirBaseUrl) {
       throw new AppError(500, "issuer_mismatch", "The saved Epic connection has an unexpected issuer.");
@@ -693,6 +1205,7 @@ export class EpicFhirClient {
       `${record.fhirBaseUrl}/${relativePath}`,
       resourceType,
       interaction,
+      requestLimits,
     );
   }
 
@@ -701,42 +1214,35 @@ export class EpicFhirClient {
     url: string,
     resourceType: string,
     interaction: "read" | "search",
+    requestLimits?: FhirRequestLimits,
   ): Promise<unknown> {
-    const { response, json } = await requestJson(url, {
-      fetch: this.fetch,
-      timeoutMs: this.config.requestTimeoutMs,
-      maxBytes: this.config.maxUpstreamBytes,
-      expectedStatus: [200, 400, 401, 403, 404, 422, 429],
-      init: {
-        headers: {
-          Accept: "application/fhir+json",
-          Authorization: `Bearer ${record.accessToken}`,
+    let receivedResponse: Response | undefined;
+    let response: Response;
+    let json: unknown;
+    try {
+      ({ response, json } = await requestJson(url, {
+        fetch: this.fetch,
+        timeoutMs: requestLimits?.timeoutMs ?? this.config.requestTimeoutMs,
+        maxBytes: requestLimits?.maxBytes ?? this.config.maxUpstreamBytes,
+        ...(requestLimits?.consumeBytes ? { consumeBytes: requestLimits.consumeBytes } : {}),
+        onResponse: (upstreamResponse) => {
+          receivedResponse = upstreamResponse;
         },
-      },
-    });
-
-    switch (response.status) {
-      case 200:
-        return json;
-      case 400:
-      case 422:
-        throw new AppError(
-          response.status,
-          hasOperationOutcomeIssue(json) ? "fhir_request_rejected" : "fhir_invalid_request",
-          interaction === "search"
-            ? `Epic rejected the ${resourceType} search parameters.`
-            : `Epic rejected the ${resourceType} read request.`,
-        );
-      case 401:
-        throw new ReconnectRequiredError();
-      case 403:
-        throw forbiddenError(response, json, resourceType, interaction);
-      case 404:
-        throw new AppError(404, "fhir_resource_not_found", "The requested FHIR resource was not found.");
-      case 429:
-        throw new EpicRateLimitError(parseRetryAfterSeconds(response));
-      default:
-        throw new UpstreamError("fhir_request_failed", "The FHIR request failed.", response.status);
+        expectedStatus: [200, 400, 401, 403, 404, 422, 429],
+        init: {
+          headers: {
+            Accept: "application/fhir+json",
+            Authorization: `Bearer ${record.accessToken}`,
+          },
+        },
+      }));
+    } catch (error) {
+      if (error instanceof UpstreamError && receivedResponse && receivedResponse.status !== 200) {
+        throw fhirStatusError(receivedResponse, {}, resourceType, interaction);
+      }
+      throw error;
     }
+    if (response.status !== 200) throw fhirStatusError(response, json, resourceType, interaction);
+    return json;
   }
 }

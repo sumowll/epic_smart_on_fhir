@@ -121,6 +121,46 @@ The discovery check is read-only. It confirms the configured SMART authorization
 
 The connector intentionally targets current R4 SMART/OIDC discovery. A healthcare organization that exposes only legacy Epic metadata endpoints will need an organization-specific compatibility adapter rather than a silent fallback.
 
+### Make a direct read-only FHIR request
+
+The operator utility in `scripts/epic-fhir-get.ts` sends a direct `GET` to the
+configured Epic FHIR base. It uses `EPIC_FHIR_BASE_URL` and `EPIC_CLIENT_ID` from
+the environment or local `.env` file and defaults to the server's
+CapabilityStatement:
+
+```bash
+pnpm run fhir:get
+```
+
+To save that validated raw CapabilityStatement as a formatted, provider-specific
+snapshot under `src/`, run:
+
+```bash
+pnpm run fhir:save-capability
+```
+
+This atomically creates or replaces `src/capability-statement.json`. Rerun the
+command after changing providers or after an Epic upgrade; the saved document is
+a point-in-time reference and is not a substitute for runtime discovery.
+
+Pass a relative FHIR path to read a resource or perform a search. Quote search
+paths so the shell does not interpret `&`:
+
+```bash
+pnpm run fhir:get -- 'Patient/example-id'
+pnpm run fhir:get -- 'Observation?patient=example-id&_count=5'
+```
+
+Protected resource calls also require a current patient-authorized token in the
+`EPIC_FHIR_ACCESS_TOKEN` environment variable. Supply that value only in the
+operator's current environment; do not add access tokens to `.env`, command-line
+arguments, source control, logs, or support evidence. The script never prints the
+token or request URL, rejects redirects, operations, history routes, credential
+query parameters, and paths outside the configured FHIR base. CapabilityStatement
+responses are limited to 2 MiB and resource responses to 5 MiB. It is a diagnostic
+utility and does not bypass the scopes, patient context, or other restrictions
+enforced by Epic.
+
 ## 4. Deploy to Cloudflare Workers
 
 The repository includes a native Worker entry point, versioned Wrangler
@@ -467,7 +507,7 @@ authentication is lost, the user disconnects, or the page is left.
 | `GET` | `/auth/callback` | Exact registered OAuth callback |
 | `GET` | `/api/connection` | Safe connection metadata, never tokens |
 | `GET` | `/api/patient` | Read the authorized Patient resource |
-| `GET` | `/api/fhir/:resourceType` | Search an allowlisted resource with its approved patient-bound or scope-restricted strategy |
+| `GET` | `/api/fhir/:resourceType` | Search an allowlisted resource with its approved patient-bound or scope-restricted strategy; `Location` is derived from patient Encounter references |
 | `GET` | `/api/fhir/:resourceType/:id` | Read an allowlisted resource instance after grant and fine-grained constraint validation |
 | `GET` | `/api/fhir-page?cursor=...` | Follow a server-issued, encrypted/authenticated session-bound cursor to the next safe Bundle page |
 | `GET` | `/api/hub/status` | Return consent state and privacy-safe hub counts for the live account context |
@@ -481,11 +521,21 @@ authentication is lost, the user disconnects, or the page is left.
 
 Search forwarding is intentionally narrow. Supported caller parameters are `_count`, `_sort`, `authoredon`, `category`, `class`, `clinical-status`, `code`, `date`, `docstatus`, `status`, and `type`. The caller cannot override the patient constraint, request `_include`/`_revinclude`, follow an arbitrary URL, or access resource types outside `EPIC_ALLOWED_RESOURCE_TYPES`. Independently of caller input, the server adds the single fixed `_revinclude=Provenance:target` value when the searched resource advertises it, Provenance is allowlisted and read-capable, and the current patient grant includes unqualified Provenance read access. Included Provenance must identify itself as an included search entry and target a primary result on the same Bundle page; all other included resource types are rejected.
 
+The derived `Location` action accepts only `_count`; it rejects direct Location
+filters because it resolves resources strictly through authorized Encounter
+references.
+
 Direct reads are limited to allowlisted resource types, require an effective Read
 grant, validate the returned resource type/ID, and enforce any category-qualified
 scope locally. Clinical searches force the authorized patient ID; approved
 supporting-resource searches rely on the patient-level SMART grant without adding
-an invalid generic `patient=` parameter. Pagination never accepts an arbitrary
+an invalid generic `patient=` parameter. Care locations are a special case: the
+connector searches the authorized patient's Encounters, deduplicates strict
+`Encounter.location[].location` references, and reads only same-server `Location`
+IDs. It never performs an unfiltered Location search or follows a reference to a
+different server. The traversal is bounded by page, read, concurrency, time, and
+cumulative upstream-byte limits; a safe `OperationOutcome` warning marks any
+partial result. Pagination never accepts an arbitrary
 upstream URL from the browser: the server validates the same-FHIR-base Bundle link
 and issues a short-lived AES-256-GCM encrypted/authenticated cursor tied to the
 session and original search.

@@ -390,6 +390,23 @@ export class EpicConnectorService {
     const serverCapabilities = new Map(
       (record.fhirCapabilities ?? []).map((capability) => [capability.resourceType, capability]),
     );
+    const hasUnrestrictedGrant = (
+      resourceType: string,
+      permission: "read" | "search",
+    ): boolean => granted.some((grant) =>
+      (grant.resourceType === resourceType || grant.resourceType === "*") &&
+      grant.permissions.has(permission) &&
+      grant.constraints.length === 0);
+    const encounterServer = serverCapabilities.get("Encounter");
+    const locationServer = serverCapabilities.get("Location");
+    const canDeriveEncounterLocations =
+      this.config.allowedResourceTypes.has("Encounter") &&
+      this.config.allowedResourceTypes.has("Location") &&
+      locationServer?.interactions.includes("read") === true &&
+      encounterServer?.interactions.includes("search") === true &&
+      serverSupportsSmartSearch("Encounter", encounterServer.searchParameters) &&
+      hasUnrestrictedGrant("Encounter", "search") &&
+      hasUnrestrictedGrant("Location", "read");
     const resourceTypes = ["Patient", ...this.config.allowedResourceTypes];
     const capabilities: ResourceCapabilitySummary[] = [];
     for (const resourceType of resourceTypes) {
@@ -442,13 +459,18 @@ export class EpicConnectorService {
             // be ambiguous, so do not advertise that unusable UI action.
             return group.length === 1 ? group : [];
           });
-      const search = Boolean(
-        server?.interactions.includes("search") &&
-        representableSearchableGrants.length > 0,
-      );
+      const search = resourceType === "Location"
+        ? canDeriveEncounterLocations
+        : Boolean(
+            server?.interactions.includes("search") &&
+            representableSearchableGrants.length > 0,
+          );
       if (!read && !search) continue;
       const constraintValues = new Map<string, Set<string>>();
-      if (!representableSearchableGrants.some((grant) => grant.constraints.length === 0)) {
+      if (
+        resourceType !== "Location" &&
+        !representableSearchableGrants.some((grant) => grant.constraints.length === 0)
+      ) {
         for (const grant of representableSearchableGrants) {
           for (const constraint of grant.constraints) {
             if (!isUserControllableSearchParameter(constraint.name)) continue;

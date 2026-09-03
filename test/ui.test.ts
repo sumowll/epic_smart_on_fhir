@@ -1191,31 +1191,40 @@ describe("legal pages", () => {
     await harness.controls.runDataRequest("/milestones", "Clinical milestones");
 
     const timeline = harness.elements["#temporal-graph-list"];
-    expect(timeline.children.map((item) => item.children[0]?.getAttribute("datetime"))).toEqual([
+    expect(timeline.children.map((item) => {
+      const dateSlot = item.children[0];
+      return dateSlot?.tagName === "TIME"
+        ? dateSlot.getAttribute("datetime")
+        : dateSlot?.children.find((child) => child.tagName === "TIME")?.getAttribute("datetime");
+    })).toEqual([
       "2017-02",
       "2018",
       "2019-01-02",
-      "2019-03",
       "2020-05-01",
-      "2021-06",
       "2022-04-03",
       "2023-01",
       "2023-04-01T00:00:00Z",
     ]);
-    expect(timeline.children.map((item) => item.children[1]?.children[2]?.textContent)).toEqual([
+    expect(timeline.children.map((item) => item.children[1]?.children.find(
+      (child) => child.className === "timeline-date-kind",
+    )?.textContent)).toEqual([
+      "Condition course",
       "Onset",
-      "Onset",
-      "Recorded",
       "Recorded",
       "Reaction onset",
-      "Abatement",
       "Last occurrence",
       "Clinically relevant occurrence bounds",
       "Issued",
     ]);
-    expect(timeline.children[7]?.children[0]?.textContent).toContain("–");
+    expect(timeline.children[0]?.children[0]?.className).toBe("timeline-time-range");
+    expect(timeline.children[0]?.children[0]?.children.map((child) => child.getAttribute("datetime"))).toEqual([
+      "2017-02",
+      undefined,
+      "2021-06",
+    ]);
+    expect(timeline.children[5]?.children[0]?.textContent).toContain("–");
     expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
-      "9 dated events from 3 of 3 records",
+      "7 dated events from 3 of 3 records",
     );
     expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
       "overlapping date ranges retain source order where chronology is uncertain",
@@ -1223,7 +1232,7 @@ describe("legal pages", () => {
     expect(harness.elements["#result-list"].hidden).toBe(true);
   });
 
-  it("coalesces matching moments within one record while keeping records and dates distinct", async () => {
+  it("coalesces equivalent moments and keeps one timeline card per Condition", async () => {
     const harness = createBrowserHarness(async (path) => {
       if (path === "/api/connection") {
         return jsonResponse({
@@ -1266,11 +1275,35 @@ describe("legal pages", () => {
             },
             {
               resource: {
+                resourceType: "Condition",
+                id: "same-course-date",
+                clinicalStatus: {
+                  coding: [{
+                    system: "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                    code: "resolved",
+                  }],
+                },
+                code: { text: "Same-date resolved condition" },
+                onsetDateTime: "2019-04-23",
+                abatementDateTime: "2019-04-23",
+                recordedDate: "2019-04-23",
+              },
+            },
+            {
+              resource: {
                 resourceType: "Observation",
                 id: "same-instant",
                 code: { text: "Same-instant observation" },
                 effectiveDateTime: "2020-01-01T00:00:00.1000Z",
                 issued: "2019-12-31T19:00:00.1-05:00",
+              },
+            },
+            {
+              resource: {
+                resourceType: "Condition",
+                id: "recorded-only",
+                code: { text: "Recorded-only condition" },
+                recordedDate: "2021-02-03",
               },
             },
           ],
@@ -1301,18 +1334,101 @@ describe("legal pages", () => {
         dateKind: "Onset",
       },
       {
-        dateTime: "2019-04-24",
-        title: "Distinct-date condition",
-        dateKind: "Recorded",
+        dateTime: "2019-04-23",
+        title: "Same-date resolved condition",
+        dateKind: "Onset · Resolution · Recorded",
       },
       {
         dateTime: "2020-01-01T00:00:00.1000Z",
         title: "Same-instant observation",
         dateKind: "Clinically relevant time · Issued",
       },
+      {
+        dateTime: "2021-02-03",
+        title: "Recorded-only condition",
+        dateKind: "Recorded",
+      },
     ]);
     expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
-      "4 dated events from 3 of 3 records",
+      "5 dated events from 5 of 5 records",
+    );
+  });
+
+  it("renders a resolved Condition once as a course with clearly dated current status", async () => {
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Patient.r"],
+          capabilities: [{
+            resourceType: "Patient",
+            read: true,
+            readConstraintAlternatives: [[]],
+            search: false,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/resolved-condition") {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Condition",
+              id: "nevus",
+              clinicalStatus: {
+                coding: [{
+                  system: "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                  code: "resolved",
+                }],
+              },
+              code: { text: "Nevus" },
+              onsetDateTime: "2020-07-07",
+              recordedDate: "2020-07-07",
+              abatementDateTime: "2023-02-01",
+            },
+          }],
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/resolved-condition", "Resolved condition");
+
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(1);
+    const card = timeline.children[0]!.children[1]!;
+    const dateSlot = timeline.children[0]!.children[0]!;
+    expect(dateSlot.className).toBe("timeline-time-range");
+    expect(dateSlot.children.map((child) => child.tagName)).toEqual(["TIME", "SPAN", "TIME"]);
+    expect(dateSlot.children.map((child) => child.getAttribute("datetime"))).toEqual([
+      "2020-07-07",
+      undefined,
+      "2023-02-01",
+    ]);
+    expect(dateSlot.children[0]?.getAttribute("aria-label")).toContain("Onset");
+    expect(dateSlot.children[2]?.getAttribute("aria-label")).toContain("Resolution");
+    expect(card.children.find((child) => child.className === "timeline-date-kind")?.textContent).toBe(
+      "Condition course",
+    );
+    const details = card.children.find((child) => child.tagName === "DL")!;
+    expect(details.children.map((child) => child.textContent)).toEqual([
+      "Current status",
+      "Resolved",
+      "Onset",
+      "Jul 7, 2020",
+      "Resolution",
+      "Feb 1, 2023",
+      "Recorded",
+      "Jul 7, 2020",
+    ]);
+    expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
+      "1 dated event from 1 of 1 record",
     );
   });
 

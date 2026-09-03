@@ -54,7 +54,6 @@ const searchableResourceTypes = [
   "Encounter",
   "Goal",
   "Immunization",
-  "Location",
   "Medication",
   "MedicationRequest",
   "Observation",
@@ -762,6 +761,728 @@ describe("FHIR client", () => {
       "Organization",
       new URLSearchParams("_count=10"),
     )).resolves.toMatchObject({ resourceType: "Bundle" });
+  });
+
+  it("derives unique care locations from patient-bound Encounter references", async () => {
+    const nextUrl = `${record.fhirBaseUrl}/Encounter?_getpages=encounter-page-2`;
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient", "_count"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString());
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer access-token");
+      if (url.pathname.endsWith("/Encounter") && !url.searchParams.has("_getpages")) {
+        expect(url.searchParams.get("patient")).toBe("patient-1");
+        expect(url.searchParams.get("_count")).toBe("100");
+        expect(url.searchParams.has("_revinclude")).toBe(false);
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          link: [{ relation: "next", url: nextUrl }],
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [
+                { location: { reference: "Location/location-1" } },
+                { location: { reference: `${record.fhirBaseUrl}/Location/location-1` } },
+                { location: { reference: "Patient/not-a-location" } },
+                { location: { reference: "https://attacker.example/Location/stolen" } },
+                { location: { reference: "#contained-location" } },
+                { location: { display: "Identifier-only location" } },
+              ],
+            },
+            search: { mode: "match" },
+          }],
+        });
+      }
+      if (input.toString() === nextUrl) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-2",
+              location: [
+                { location: { reference: "Location/location-2" } },
+                { location: { reference: "Location/location-1" } },
+              ],
+            },
+            search: { mode: "match" },
+          }, {
+            fullUrl: "urn:uuid:encounter-warning",
+            resource: {
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "warning", code: "processing" }],
+            },
+            search: { mode: "outcome" },
+          }],
+        });
+      }
+      if (url.pathname.endsWith("/Location/location-1")) {
+        return jsonResponse({ resourceType: "Location", id: "location-1", name: "Clinic A" });
+      }
+      if (url.pathname.endsWith("/Location/location-2")) {
+        return jsonResponse({ resourceType: "Location", id: "location-2", name: "Clinic B" });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    const result = await client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=2"),
+    ) as Record<string, unknown>;
+    const entries = result.entry as Array<{ resource: Record<string, unknown> }>;
+    expect(entries.filter(({ resource }) => resource.resourceType === "Location"))
+      .toEqual([
+        expect.objectContaining({ resource: expect.objectContaining({ id: "location-1" }) }),
+        expect.objectContaining({ resource: expect.objectContaining({ id: "location-2" }) }),
+      ]);
+    expect(entries.filter(({ resource }) => resource.resourceType === "OperationOutcome"))
+      .toHaveLength(2);
+    expect(result.total).toBeUndefined();
+    expect(result.link).toEqual([]);
+    const fetchedUrls = fetchMock.mock.calls.map(([input]) => input!.toString());
+    expect(fetchedUrls).toEqual(expect.arrayContaining([
+      nextUrl,
+      `${record.fhirBaseUrl}/Location/location-1`,
+      `${record.fhirBaseUrl}/Location/location-2`,
+    ]));
+    expect(fetchedUrls.every((url) => !url.startsWith("https://attacker.example"))).toBe(true);
+    expect(fetchedUrls.filter((url) => url.endsWith("/Location/location-1"))).toHaveLength(1);
+  });
+
+  it("returns an exact Location searchset when Encounter references are complete", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [{ location: { reference: "Location/location-1" } }],
+            },
+          }],
+        });
+      }
+      return jsonResponse({ resourceType: "Location", id: "location-1", name: "Clinic A" });
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    )).resolves.toEqual({
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 1,
+      link: [],
+      entry: [{
+        fullUrl: `${record.fhirBaseUrl}/Location/location-1`,
+        resource: { resourceType: "Location", id: "location-1", name: "Clinic A" },
+        search: { mode: "match" },
+      }],
+    });
+  });
+
+  it("returns an exact empty Location searchset when Encounters have no locations", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async () => jsonResponse({
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 0,
+      entry: [],
+    }));
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=20"),
+    )).resolves.toEqual({
+      resourceType: "Bundle",
+      type: "searchset",
+      total: 0,
+      link: [],
+      entry: [],
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("continues past a stale reference to fill the requested Location count", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [
+                { location: { reference: "Location/deleted-location" } },
+                { location: { reference: "Location/available-location" } },
+              ],
+            },
+          }],
+        });
+      }
+      if (url.pathname.endsWith("/Location/available-location")) {
+        return jsonResponse({
+          resourceType: "Location",
+          id: "available-location",
+          name: "Available clinic",
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    const result = await client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    ) as { entry: Array<{ resource: Record<string, unknown> }> };
+    expect(result.entry).toHaveLength(2);
+    expect(result.entry[0]?.resource).toMatchObject({
+      resourceType: "Location",
+      id: "available-location",
+    });
+    expect(result.entry[1]?.resource.resourceType).toBe("OperationOutcome");
+  });
+
+  it("caps Encounter pagination while deriving care locations", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    let encounterPages = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      expect(url.pathname.endsWith("/Encounter")).toBe(true);
+      encounterPages += 1;
+      return jsonResponse({
+        resourceType: "Bundle",
+        type: "searchset",
+        entry: [],
+        link: [{
+          relation: "next",
+          url: `${record.fhirBaseUrl}/Encounter?_getpages=page-${encounterPages + 1}`,
+        }],
+      });
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    const result = await client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=20"),
+    ) as { total?: number; entry: Array<{ resource: Record<string, unknown> }> };
+    expect(encounterPages).toBe(10);
+    expect(result.total).toBeUndefined();
+    expect(result.entry).toHaveLength(1);
+    expect(result.entry[0]?.resource.resourceType).toBe("OperationOutcome");
+  });
+
+  it("caps Location reads at 100 and resolves no more than four concurrently", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    let activeLocationReads = 0;
+    let maximumConcurrentReads = 0;
+    let locationReads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-with-many-locations",
+              location: Array.from({ length: 101 }, (_, index) => ({
+                location: { reference: `Location/location-${index + 1}` },
+              })),
+            },
+          }],
+        });
+      }
+      const id = url.pathname.split("/").at(-1)!;
+      locationReads += 1;
+      activeLocationReads += 1;
+      maximumConcurrentReads = Math.max(maximumConcurrentReads, activeLocationReads);
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      activeLocationReads -= 1;
+      return jsonResponse({ resourceType: "Location", id });
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    const result = await client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=100"),
+    ) as { entry: Array<{ resource: Record<string, unknown> }> };
+    expect(locationReads).toBe(100);
+    expect(maximumConcurrentReads).toBe(4);
+    expect(result.entry.filter(({ resource }) => resource.resourceType === "Location"))
+      .toHaveLength(100);
+    expect(fetchMock.mock.calls.some(([input]) => input!.toString().endsWith("/location-101")))
+      .toBe(false);
+    expect(result.entry.at(-1)?.resource.resourceType).toBe("OperationOutcome");
+  });
+
+  it("stops discarded Location reads when the aggregate upstream byte budget is exhausted", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    let locationReads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-with-stale-locations",
+              location: [
+                ...Array.from({ length: 10 }, (_, index) => ({
+                  location: { reference: `Location/stale-${index + 1}` },
+                })),
+                { location: { reference: "Location/available-location" } },
+              ],
+            },
+          }],
+        });
+      }
+      locationReads += 1;
+      if (url.pathname.endsWith("/Location/available-location")) {
+        return jsonResponse({ resourceType: "Location", id: "available-location" });
+      }
+      return jsonResponse({
+        resourceType: "OperationOutcome",
+        issue: [{ severity: "error", code: "not-found", diagnostics: "x".repeat(1_500) }],
+      }, 404);
+    });
+    const baseConfig = makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" });
+    const client = new EpicFhirClient(
+      { ...baseConfig, maxUpstreamBytes: 4_096 },
+      fetchMock as FetchLike,
+    );
+
+    const result = await client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    ) as { total?: number; entry: Array<{ resource: Record<string, unknown> }> };
+    expect(locationReads).toBeLessThan(11);
+    expect(fetchMock.mock.calls.some(([input]) =>
+      input!.toString().endsWith("/Location/available-location"))).toBe(false);
+    expect(result.total).toBeUndefined();
+    expect(result.entry).toHaveLength(1);
+    expect(result.entry[0]?.resource.resourceType).toBe("OperationOutcome");
+  });
+
+  it("propagates Location read rate limits during Encounter derivation", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [{ location: { reference: "Location/location-1" } }],
+            },
+          }],
+        });
+      }
+      return new Response(JSON.stringify({ resourceType: "OperationOutcome", issue: [{}] }), {
+        status: 429,
+        headers: { "content-type": "application/fhir+json", "retry-after": "9" },
+      });
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    )).rejects.toEqual(expect.objectContaining({
+      code: "epic_rate_limited",
+      retryAfterSeconds: 9,
+    }));
+  });
+
+  it.each([
+    { status: 401, expected: { code: "reconnect_required" } },
+    { status: 429, expected: { code: "epic_rate_limited", retryAfterSeconds: 7 } },
+  ])("does not mask a $status response when its body exceeds the remaining byte budget", async ({
+    status,
+    expected,
+  }) => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const encounterBody = {
+      resourceType: "Bundle",
+      type: "searchset",
+      entry: [{
+        resource: {
+          resourceType: "Encounter",
+          id: "encounter-before-fatal-response",
+          location: [
+            ...Array.from({ length: 4 }, (_, index) => ({
+              location: { reference: `Location/stale-${index + 1}` },
+            })),
+            { location: { reference: "Location/fatal-response" } },
+          ],
+        },
+      }],
+    };
+    const staleBody = {
+      resourceType: "OperationOutcome",
+      issue: [{ severity: "error", code: "not-found", diagnostics: "x".repeat(1_200) }],
+    };
+    const fatalBody = {
+      resourceType: "OperationOutcome",
+      issue: [{ severity: "error", code: "processing", diagnostics: "x".repeat(3_000) }],
+    };
+    const encodedLength = (value: unknown): number =>
+      new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    const operationByteBudget = 2 * 4_096;
+    const bytesBeforeFatalResponse = encodedLength(encounterBody) + 4 * encodedLength(staleBody);
+    expect(bytesBeforeFatalResponse).toBeLessThan(operationByteBudget);
+    expect(bytesBeforeFatalResponse + encodedLength(fatalBody)).toBeGreaterThan(operationByteBudget);
+    expect(encodedLength(fatalBody)).toBeLessThan(4_096);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse(encounterBody);
+      }
+      if (!url.pathname.endsWith("/Location/fatal-response")) {
+        return jsonResponse(staleBody, 404);
+      }
+      return new Response(JSON.stringify(fatalBody), {
+        status,
+        headers: { "content-type": "application/fhir+json", "retry-after": "7" },
+      });
+    });
+    const baseConfig = makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" });
+    const client = new EpicFhirClient(
+      { ...baseConfig, maxUpstreamBytes: 4_096 },
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    )).rejects.toEqual(expect.objectContaining(expected));
+  });
+
+  it("preserves a rate limit when the 429 body exceeds the per-response cap", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const oversizedBody = JSON.stringify({
+      resourceType: "OperationOutcome",
+      issue: [{ severity: "error", code: "processing", diagnostics: "x".repeat(5_000) }],
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [{ location: { reference: "Location/rate-limited" } }],
+            },
+          }],
+        });
+      }
+      return new Response(oversizedBody, {
+        status: 429,
+        headers: {
+          "content-length": String(new TextEncoder().encode(oversizedBody).byteLength),
+          "content-type": "application/fhir+json",
+          "retry-after": "3",
+        },
+      });
+    });
+    const baseConfig = makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" });
+    const client = new EpicFhirClient(
+      { ...baseConfig, maxUpstreamBytes: 4_096 },
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=1"),
+    )).rejects.toEqual(expect.objectContaining({
+      code: "epic_rate_limited",
+      retryAfterSeconds: 3,
+    }));
+  });
+
+  it("preserves the first fatal error from concurrent Location reads", async () => {
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["patient"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.pathname.endsWith("/Encounter")) {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "Encounter",
+              id: "encounter-1",
+              location: [
+                { location: { reference: "Location/rate-limited" } },
+                { location: { reference: "Location/later-failure" } },
+              ],
+            },
+          }],
+        });
+      }
+      if (url.pathname.endsWith("/Location/rate-limited")) {
+        return new Response(JSON.stringify({ resourceType: "OperationOutcome", issue: [{}] }), {
+          status: 429,
+          headers: { "content-type": "application/fhir+json", "retry-after": "5" },
+        });
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      return jsonResponse({ resourceType: "OperationOutcome", issue: [{}] }, 500);
+    });
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=2"),
+    )).rejects.toEqual(expect.objectContaining({
+      code: "epic_rate_limited",
+      retryAfterSeconds: 5,
+    }));
+  });
+
+  it("rejects direct Location filters and requires Encounter search plus Location read", async () => {
+    const capabilities: ConnectionRecord["fhirCapabilities"] = [{
+      resourceType: "Encounter",
+      interactions: ["search"],
+      searchParameters: ["patient"],
+    }, {
+      resourceType: "Location",
+      interactions: ["read", "search"],
+      searchParameters: ["_id", "status"],
+    }];
+    const fetchMock = vi.fn();
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+
+    await expect(client.search(
+      { ...record, scope: "patient/Encounter.s patient/Location.r", fhirCapabilities: capabilities },
+      "Location",
+      new URLSearchParams("status=active"),
+    )).rejects.toMatchObject({ code: "location_search_filter_not_supported" });
+    await expect(client.search(
+      { ...record, scope: "patient/Location.s", fhirCapabilities: capabilities },
+      "Location",
+      new URLSearchParams("_count=20"),
+    )).rejects.toMatchObject({ code: "fhir_scope_denied" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not derive locations when Encounter search lacks the patient parameter", async () => {
+    const fetchMock = vi.fn();
+    const client = new EpicFhirClient(
+      makeConfig({ EPIC_ALLOWED_RESOURCE_TYPES: "Encounter,Location" }),
+      fetchMock as FetchLike,
+    );
+    const derivedRecord: ConnectionRecord = {
+      ...record,
+      scope: "patient/Encounter.s patient/Location.r",
+      fhirCapabilities: [{
+        resourceType: "Encounter",
+        interactions: ["search"],
+        searchParameters: ["_count"],
+      }, {
+        resourceType: "Location",
+        interactions: ["read"],
+        searchParameters: [],
+      }],
+    };
+
+    await expect(client.search(
+      derivedRecord,
+      "Location",
+      new URLSearchParams("_count=20"),
+    )).rejects.toMatchObject({ code: "fhir_search_parameter_unavailable" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("blocks Binary search and direct read until reference proof is implemented", async () => {

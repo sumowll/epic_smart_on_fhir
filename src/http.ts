@@ -5,14 +5,25 @@ export interface JsonRequestOptions {
   readonly fetch: FetchLike;
   readonly timeoutMs: number;
   readonly maxBytes: number;
+  readonly consumeBytes?: (byteLength: number) => boolean;
+  readonly onResponse?: (response: Response) => void;
   readonly init?: RequestInit;
   readonly expectedStatus?: readonly number[];
 }
 
-async function readLimited(response: Response, maxBytes: number): Promise<string> {
+async function readLimited(
+  response: Response,
+  maxBytes: number,
+  consumeBytes?: (byteLength: number) => boolean,
+): Promise<string> {
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw new UpstreamError("upstream_too_large", "The Epic server returned an oversized response.");
+    if (response.body) await response.body.cancel().catch(() => undefined);
+    throw new UpstreamError(
+      "upstream_too_large",
+      "The Epic server returned an oversized response.",
+      response.status,
+    );
   }
   if (!response.body) return "";
 
@@ -20,18 +31,41 @@ async function readLimited(response: Response, maxBytes: number): Promise<string
   const decoder = new TextDecoder();
   let size = 0;
   let text = "";
-  while (true) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    size += chunk.value.byteLength;
-    if (size > maxBytes) {
-      await reader.cancel();
-      throw new UpstreamError("upstream_too_large", "The Epic server returned an oversized response.");
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new UpstreamError(
+          "upstream_too_large",
+          "The Epic server returned an oversized response.",
+          response.status,
+        );
+      }
+      if (consumeBytes && !consumeBytes(chunk.value.byteLength)) {
+        await reader.cancel().catch(() => undefined);
+        throw new UpstreamError(
+          "upstream_byte_budget_exceeded",
+          "The Epic server returned more data than this operation permits.",
+          response.status,
+        );
+      }
+      text += decoder.decode(chunk.value, { stream: true });
     }
-    text += decoder.decode(chunk.value, { stream: true });
+    text += decoder.decode();
+    return text;
+  } catch (error) {
+    if (error instanceof UpstreamError) throw error;
+    await reader.cancel().catch(() => undefined);
+    throw new UpstreamError(
+      "upstream_unavailable",
+      "The Epic response was interrupted. Please try again.",
+      response.status,
+      { cause: error },
+    );
   }
-  text += decoder.decode();
-  return text;
 }
 
 export async function requestJson(
@@ -71,7 +105,9 @@ export async function requestJson(
     );
   }
 
-  const text = await readLimited(response, options.maxBytes);
+  options.onResponse?.(response);
+
+  const text = await readLimited(response, options.maxBytes, options.consumeBytes);
   let json: unknown;
   try {
     json = text ? JSON.parse(text) : {};

@@ -51,7 +51,7 @@ const resourceCapabilityGroups: readonly ResourceCapabilityGroup[] = [
     label: "Medications and treatment",
     resources: [
       { type: "Device", label: "Medical devices" },
-      { type: "Immunization", label: "Vaccines" },
+      { type: "Immunization", label: "Immunization" },
       { type: "Medication", label: "Medications" },
       { type: "MedicationRequest", label: "Medication orders" },
       { type: "Procedure", label: "Procedures" },
@@ -195,7 +195,8 @@ export function renderHome(config: AppConfig): string {
         </form>
         <p id="capability-notice" class="hint" hidden>No supported health-data actions were granted for this connection.</p>
         <p class="hint">Results depend on the read/search APIs selected on your Epic app record and authorized by the patient.</p>
-        <p class="hint">When Epic advertises record-source support and the patient grants access, searches automatically include available Provenance details in Advanced.</p>
+        <p class="hint">Care locations are resolved from Location references in the patient’s authorized visit and encounter records.</p>
+        <p class="hint">When Epic advertises record-source support and the patient grants access, direct resource searches automatically include available Provenance details in Advanced.</p>
         ${resourceSelector.binaryConfigured ? '<p class="hint">Binary attachment access is disabled until a verified document-reference workflow is available.</p>' : ""}
         <div id="result-status" class="result-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">No health data loaded.</div>
         <div id="result-error" class="status error result-error" role="alert" tabindex="-1" hidden></div>
@@ -539,6 +540,8 @@ select, input { width: 100%; border: 1px solid #c8d7db; border-radius: 9px; back
 .timeline-event::before { content: ""; position: absolute; z-index: 1; top: 5px; left: 4px; width: 10px; height: 10px; border: 3px solid white; border-radius: 50%; background: #08786e; box-shadow: 0 0 0 2px #69aaa2; }
 .timeline-event-undated::before, .timeline-event-undated::after { display: none; }
 .timeline-time-empty { min-height: 1px; }
+.timeline-time-range { color: #08655d; font-size: .84rem; font-weight: 800; line-height: 1.45; }
+.timeline-time-range time { color: inherit; font: inherit; white-space: nowrap; }
 .timeline-event time { color: #08655d; font-size: .84rem; font-weight: 800; line-height: 1.45; }
 .timeline-event article { min-width: 0; padding: 12px 14px; border: 1px solid #d8e3e7; border-radius: 10px; background: white; box-shadow: 0 5px 18px rgba(26,61,72,.05); }
 .timeline-event .resource-kind { margin: 0 0 4px; color: #08786e; font-size: .7rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
@@ -1316,6 +1319,42 @@ function readableDate(value) {
   }).format(parsed);
 }
 
+function readableConditionBoundaryPeriod(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const start = readableDate(value.start);
+  const end = readableDate(value.end);
+  if (start && end) return start + ' – ' + end;
+  if (start) return 'On or after ' + start;
+  return end ? 'On or before ' + end : '';
+}
+
+function conditionClinicalStatusCode(resource) {
+  const status = resource.clinicalStatus || resource.status;
+  if (typeof status === 'string') return status.trim().toLowerCase();
+  if (!status || typeof status !== 'object' || Array.isArray(status)) return '';
+  if (typeof status.code === 'string') return status.code.trim().toLowerCase();
+  if (!Array.isArray(status.coding)) return '';
+  const preferred = status.coding.find((coding) =>
+    coding && coding.system === 'http://terminology.hl7.org/CodeSystem/condition-clinical' &&
+    typeof coding.code === 'string'
+  );
+  const fallback = status.coding.find((coding) => coding && typeof coding.code === 'string');
+  return ((preferred || fallback)?.code || '').trim().toLowerCase();
+}
+
+function conditionEndLabel(resource) {
+  switch (conditionClinicalStatusCode(resource)) {
+    case 'resolved':
+      return 'Resolution';
+    case 'remission':
+      return 'Entered remission';
+    case 'inactive':
+      return 'Became inactive';
+    default:
+      return 'Ended';
+  }
+}
+
 function firstPresentChoice(resource, names) {
   for (const name of names) {
     if (resource[name] !== undefined && resource[name] !== null) return resource[name];
@@ -1401,7 +1440,7 @@ function friendlyResourceName(resourceType) {
   return names[resourceType] || humanizeCode(resourceType);
 }
 
-function resourceDetails(resource) {
+function resourceDetails(resource, options = {}) {
   const details = [];
   const add = (label, value) => {
     const text = readableText(value);
@@ -1417,6 +1456,9 @@ function resourceDetails(resource) {
   if (resource.resourceType === 'Patient') {
     addDate('Date of birth', resource.birthDate);
     add('Administrative sex', resource.gender && humanizeCode(resource.gender));
+  } else if (resource.resourceType === 'Condition') {
+    add(options.timeline === true ? 'Current status' : 'Status', resource.clinicalStatus || resource.status);
+    add('Verification', resource.verificationStatus);
   } else {
     add('Status', resource.clinicalStatus || resource.status || resource.verificationStatus);
   }
@@ -1427,7 +1469,15 @@ function resourceDetails(resource) {
       addDate('Date', resource.effectiveDateTime || resource.issued);
       break;
     case 'Condition':
-      addDate('Onset', resource.onsetDateTime);
+      add(
+        'Onset',
+        readableDate(resource.onsetDateTime) || readableConditionBoundaryPeriod(resource.onsetPeriod),
+      );
+      add(
+        conditionEndLabel(resource),
+        readableDate(resource.abatementDateTime) ||
+          readableConditionBoundaryPeriod(resource.abatementPeriod),
+      );
       addDate('Recorded', resource.recordedDate);
       break;
     case 'Encounter':
@@ -1721,6 +1771,78 @@ function observationTimelineMoments(resource) {
   ]);
 }
 
+function conditionBoundaryTimelineMoment(dateTime, period, dateKind) {
+  const instant = timelineInstant(dateTime, dateKind, 'dateTime');
+  if (instant) return instant;
+  const range = timelinePeriod(period, dateKind + ' period');
+  if (!range) return null;
+  return {
+    ...range,
+    dateLabel: readableConditionBoundaryPeriod(period) || range.dateLabel,
+  };
+}
+
+function conditionTimelineMoment(resource) {
+  const onset = conditionBoundaryTimelineMoment(
+    resource.onsetDateTime,
+    resource.onsetPeriod,
+    'Onset',
+  );
+  const abatement = conditionBoundaryTimelineMoment(
+    resource.abatementDateTime,
+    resource.abatementPeriod,
+    'Ended',
+  );
+  const recorded = timelineInstant(resource.recordedDate, 'Recorded', 'dateTime');
+  const withMatchingRecorded = (moment) => {
+    if (!moment || !recorded || moment.momentKey !== recorded.momentKey) return moment;
+    return { ...moment, dateKind: moment.dateKind + ' · Recorded' };
+  };
+  if (!onset && !abatement) return recorded;
+  if (!onset) {
+    return withMatchingRecorded({ ...abatement, dateKind: conditionEndLabel(resource) });
+  }
+  if (!abatement || timelineDefinitelyBefore(abatement, onset)) {
+    return withMatchingRecorded(onset);
+  }
+  const endLabel = conditionEndLabel(resource);
+  if (onset.momentKey === abatement.momentKey) {
+    const combinedMoment = withMatchingRecorded({
+      ...onset,
+      dateKind: 'Onset · ' + endLabel,
+    });
+    return {
+      ...combinedMoment,
+      momentKey: 'condition-course|' + onset.momentKey + '|' + abatement.momentKey,
+    };
+  }
+  return {
+    sortStart: onset.sortStart,
+    sortEnd: onset.sortEnd,
+    sortEndExclusive: onset.sortEndExclusive,
+    sortStartFloating: onset.sortStartFloating,
+    sortEndFloating: onset.sortEndFloating,
+    dateTime: onset.dateTime,
+    dateLabel: onset.dateLabel + ' – ' + abatement.dateLabel,
+    dateKind: 'Condition course',
+    momentKey: 'condition-course|' + onset.momentKey + '|' + abatement.momentKey,
+    dateRange: {
+      start: {
+        dateTime: onset.dateTime,
+        dateLabel: onset.dateLabel,
+        dateKind: onset.dateKind,
+        exact: onset.momentKey.startsWith('point|'),
+      },
+      end: {
+        dateTime: abatement.dateTime,
+        dateLabel: abatement.dateLabel,
+        dateKind: endLabel,
+        exact: abatement.momentKey.startsWith('point|'),
+      },
+    },
+  };
+}
+
 function timelineMomentsForResource(resource) {
   switch (resource.resourceType) {
     case 'AllergyIntolerance':
@@ -1765,17 +1887,7 @@ function timelineMomentsForResource(resource) {
           : [],
       ]);
     case 'Condition':
-      return compactTimelineMoments([
-        firstTimelineChoice([
-          [timelineInstant(resource.onsetDateTime, 'Onset', 'dateTime')],
-          [timelinePeriod(resource.onsetPeriod, 'Onset period')],
-        ]),
-        firstTimelineChoice([
-          [timelineInstant(resource.abatementDateTime, 'Abatement', 'dateTime')],
-          [timelinePeriod(resource.abatementPeriod, 'Abatement period')],
-        ]),
-        timelineInstant(resource.recordedDate, 'Recorded', 'dateTime'),
-      ]);
+      return compactTimelineMoments([conditionTimelineMoment(resource)]);
     case 'DiagnosticReport':
       return compactTimelineMoments([
         firstTimelineChoice([
@@ -2006,6 +2118,32 @@ function renderTemporalEventList() {
       dateSlot = document.createElement('span');
       dateSlot.className = 'timeline-time-empty';
       dateSlot.setAttribute('aria-hidden', 'true');
+    } else if (event.dateRange) {
+      dateSlot = document.createElement('span');
+      dateSlot.className = 'timeline-time-range';
+      const rangeStart = document.createElement(event.dateRange.start.exact ? 'time' : 'span');
+      rangeStart.className = 'timeline-time-boundary';
+      if (event.dateRange.start.exact) {
+        rangeStart.setAttribute('datetime', event.dateRange.start.dateTime);
+      }
+      rangeStart.setAttribute(
+        'aria-label',
+        event.dateRange.start.dateKind + ' ' + event.dateRange.start.dateLabel,
+      );
+      rangeStart.textContent = event.dateRange.start.dateLabel;
+      const rangeSeparator = document.createElement('span');
+      rangeSeparator.textContent = ' to ';
+      const rangeEnd = document.createElement(event.dateRange.end.exact ? 'time' : 'span');
+      rangeEnd.className = 'timeline-time-boundary';
+      if (event.dateRange.end.exact) {
+        rangeEnd.setAttribute('datetime', event.dateRange.end.dateTime);
+      }
+      rangeEnd.setAttribute(
+        'aria-label',
+        event.dateRange.end.dateKind + ' ' + event.dateRange.end.dateLabel,
+      );
+      rangeEnd.textContent = event.dateRange.end.dateLabel;
+      dateSlot.append(rangeStart, rangeSeparator, rangeEnd);
     } else {
       dateSlot = document.createElement('time');
       dateSlot.setAttribute('datetime', event.dateTime);
@@ -2083,7 +2221,7 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
     card.append(dateKind);
   }
 
-  const details = resourceDetails(resource);
+  const details = resourceDetails(resource, options);
   if (details.length > 0) {
     const list = document.createElement('dl');
     for (const detail of details) {
@@ -2169,7 +2307,7 @@ function renderFriendlyResult(value) {
     const warning = document.createElement('p');
     warning.className = 'result-warning';
     warning.setAttribute('role', 'listitem');
-    warning.textContent = 'Epic also returned ' + outcomeCount + ' processing notice' +
+    warning.textContent = 'The response also includes ' + outcomeCount + ' processing notice' +
       (outcomeCount === 1 ? '' : 's') + '. Review Advanced only if you need the technical details.';
     resultList.append(warning);
   }
@@ -2206,7 +2344,7 @@ function showResult(value, label, pageNumber, previousView) {
         : ' contains ' + friendlySummary.recordCount + ' record' + (friendlySummary.recordCount === 1 ? '' : 's')) + '.'
     : '';
   const outcomeDescription = friendlySummary.outcomeCount > 0
-    ? ' Epic also returned ' + friendlySummary.outcomeCount + ' processing notice' +
+    ? ' The response also includes ' + friendlySummary.outcomeCount + ' processing notice' +
       (friendlySummary.outcomeCount === 1 ? '' : 's') + '.'
     : '';
   const provenanceDescription = friendlySummary.provenanceCount > 0
