@@ -284,6 +284,10 @@ export function formatResponseBody(body: string): string {
   }
 }
 
+export function normalizeCommandArguments(args: readonly string[]): readonly string[] {
+  return args[0] === "--" ? args.slice(1) : args;
+}
+
 function usage(): string {
   return [
     "Usage: pnpm run fhir:get -- [relative-fhir-path]",
@@ -305,11 +309,12 @@ export async function run(
   args: readonly string[] = process.argv.slice(2),
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
-  if (args.includes("--help") || args.includes("-h")) {
+  const commandArguments = normalizeCommandArguments(args);
+  if (commandArguments.includes("--help") || commandArguments.includes("-h")) {
     process.stdout.write(`${usage()}\n`);
     return 0;
   }
-  if (args.length > 1 || args[0]?.startsWith("-")) {
+  if (commandArguments.length > 1 || commandArguments[0]?.startsWith("-")) {
     throw new Error(`Invalid arguments.\n\n${usage()}`);
   }
 
@@ -318,7 +323,7 @@ export async function run(
     fhirBaseUrl: requiredEnvironmentValue(environment, "EPIC_FHIR_BASE_URL"),
     clientId: requiredEnvironmentValue(environment, "EPIC_CLIENT_ID"),
     ...(accessToken === undefined ? {} : { accessToken }),
-    requestPath: args[0] ?? DEFAULT_FHIR_PATH,
+    requestPath: commandArguments[0] ?? DEFAULT_FHIR_PATH,
   });
 
   const label = result.statusText

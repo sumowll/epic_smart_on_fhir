@@ -4,10 +4,34 @@ import {
   DEFAULT_FHIR_PATH,
   buildFhirRequestUrl,
   formatResponseBody,
+  normalizeCommandArguments,
   requestEpicFhir,
+  run,
 } from "../scripts/epic-fhir-get.js";
 
 describe("Epic direct FHIR GET script", () => {
+  it("accepts pnpm's forwarded argument separator", () => {
+    expect(normalizeCommandArguments(["--", "Location/example"])).toEqual([
+      "Location/example",
+    ]);
+    expect(normalizeCommandArguments(["Location/example"])).toEqual([
+      "Location/example",
+    ]);
+    expect(normalizeCommandArguments(["--", "--", "Location/example"])).toEqual([
+      "--",
+      "Location/example",
+    ]);
+  });
+
+  it("uses the path after pnpm's separator and still rejects extra arguments", async () => {
+    await expect(run(["--", "Location/example"], {})).rejects.toThrow(
+      /EPIC_FHIR_BASE_URL/,
+    );
+    await expect(run(["--", "Location/one", "Location/two"], {})).rejects.toThrow(
+      /Invalid arguments/,
+    );
+  });
+
   it("targets the CapabilityStatement by default", () => {
     expect(
       buildFhirRequestUrl("https://ehr.example.test/api/FHIR/R4", DEFAULT_FHIR_PATH)
