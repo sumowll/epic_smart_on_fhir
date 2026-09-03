@@ -313,6 +313,20 @@ function createBrowserHarness(
   };
 }
 
+function cardDetails(card: FakeElement | undefined): ReadonlyMap<string, string> {
+  const details = new Map<string, string>();
+  const list = card?.children.find((child) => child.tagName === "DL");
+  if (!list) return details;
+  for (let index = 0; index + 1 < list.children.length; index += 2) {
+    const term = list.children[index];
+    const description = list.children[index + 1];
+    if (term?.tagName === "DT" && description?.tagName === "DD") {
+      details.set(term.textContent, description.textContent);
+    }
+  }
+  return details;
+}
+
 describe("legal pages", () => {
   it("renders a safe callback support reference", () => {
     const html = renderError("Authorization failed.", {
@@ -348,6 +362,9 @@ describe("legal pages", () => {
     expect(html).toContain('id="copy-resources"');
     expect(html).toContain('id="copy-resources-status"');
     expect(html).toContain('id="result-list"');
+    expect(html).toContain(
+      '<button id="patient" class="secondary" type="button" hidden disabled>View profile</button>',
+    );
     expect(html).toContain('id="temporal-graph"');
     expect(html).toContain('id="temporal-graph-list"');
     expect(html).toContain('id="temporal-graph-order"');
@@ -942,6 +959,190 @@ describe("legal pages", () => {
     await retriedDetailButton.dispatch("click");
     expect(harness.elements["#result-error"].textContent).toContain("no longer available");
     expect(harness.elements["#result"].textContent).toContain('"resourceType": "Bundle"');
+  });
+
+  it("shows every field returned for encounter-derived Location resources", async () => {
+    const location = {
+      resourceType: "Location",
+      id: "location-1",
+      meta: {
+        versionId: "4",
+        lastUpdated: "2026-08-24T20:00:00Z",
+      },
+      implicitRules: "https://example.test/fhir/location-rules",
+      language: "en",
+      text: {
+        status: "generated",
+        div: '<div xmlns="http://www.w3.org/1999/xhtml"><img src=x onerror=alert(1)></div>',
+      },
+      contained: [{
+        resourceType: "Organization",
+        id: "contained-organization",
+        name: "On-site services",
+      }],
+      extension: [{
+        url: "https://example.test/fhir/location-campus-code",
+        valueString: "CAMPUS-A",
+      }],
+      modifierExtension: [{
+        url: "https://example.test/fhir/location-restricted",
+        valueBoolean: false,
+      }],
+      identifier: [{
+        use: "official",
+        system: "https://example.test/location-ids",
+        value: "FAC-100",
+      }],
+      status: "active",
+      operationalStatus: {
+        system: "http://terminology.hl7.org/CodeSystem/v2-0116",
+        code: "H",
+        display: "Housekeeping",
+      },
+      name: "Main Campus",
+      alias: ["Downtown campus", "Central hospital"],
+      description: "Main outpatient and inpatient campus",
+      mode: "instance",
+      type: [{
+        coding: [{
+          system: "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+          code: "HOSP",
+          display: "Hospital",
+        }],
+        text: "Hospital campus",
+      }],
+      telecom: [
+        { system: "phone", value: "617-555-0100", use: "work" },
+        { system: "email", value: "campus@example.test", use: "work" },
+      ],
+      address: {
+        use: "work",
+        type: "physical",
+        text: "100 Main St, Suite 200, Boston, MA 02110",
+        line: ["100 Main St", "Suite 200"],
+        city: "Boston",
+        district: "Suffolk",
+        state: "MA",
+        postalCode: "02110",
+        country: "US",
+      },
+      physicalType: {
+        coding: [{ code: "bu", display: "Building" }],
+        text: "Building",
+      },
+      position: {
+        longitude: -71.0589,
+        latitude: 42.3601,
+        altitude: 8,
+      },
+      managingOrganization: {
+        reference: "Organization/organization-1",
+        display: "Example Health",
+      },
+      partOf: {
+        reference: "Location/campus-1",
+        display: "Example Medical Center",
+      },
+      hoursOfOperation: [
+        {
+          daysOfWeek: ["mon", "tue"],
+          allDay: false,
+          openingTime: "08:00:00",
+          closingTime: "17:00:00",
+        },
+        { daysOfWeek: ["sat"], allDay: true },
+      ],
+      availabilityExceptions: "Emergency department is always open",
+      endpoint: [{
+        reference: "Endpoint/endpoint-1",
+        display: "Scheduling endpoint",
+      }],
+      epicCustomLocationField: {
+        campusZone: "North",
+        wheelchairAccessible: true,
+      },
+    };
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Location.r", "patient/Location.s"],
+          capabilities: [{
+            resourceType: "Location",
+            read: true,
+            readConstraintAlternatives: [[]],
+            search: true,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/location-card-test") {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{ resource: location }],
+        });
+      }
+      if (path === "/location-direct-test") return jsonResponse(location);
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/location-card-test", "Visited locations");
+
+    const card = harness.elements["#temporal-graph-list"].children[0]?.children[1];
+    expect(card?.className).toBe("timeline-event-card");
+    expect(card?.children.find((child) => child.tagName === "H4")?.textContent).toBe(
+      "Main Campus",
+    );
+    expect(card?.children.find(
+      (child) => child.className.includes("resource-semantics-warning"),
+    )?.textContent).toContain("This Location resource");
+    const details = cardDetails(card);
+    expect(details.size).toBe(Object.keys(location).length);
+    expect(details.get("FHIR resource ID")).toBe("location-1");
+    expect(details.get("Record metadata")).toContain("Version Id: 4");
+    expect(details.get("Operational status")).toContain("Display: Housekeeping");
+    expect(details.get("Aliases")).toContain("Central hospital");
+    expect(details.get("Types")).toContain("Hospital campus");
+    expect(details.get("Contact details")).toContain("Value: 617-555-0100");
+    expect(details.get("Contact details")).toContain("Value: campus@example.test");
+    expect(details.get("Address")).toContain("Line:\n  1. 100 Main St\n  2. Suite 200");
+    expect(details.get("Address")).toContain("City: Boston");
+    expect(details.get("Address")).toContain("District: Suffolk");
+    expect(details.get("Address")).toContain("Postal Code: 02110");
+    expect(details.get("Coordinates")).toContain("Latitude: 42.3601");
+    expect(details.get("Managing organization")).toContain("Reference: Organization/organization-1");
+    expect(details.get("Parent location")).toContain("Reference: Location/campus-1");
+    expect(details.get("Hours of operation")).toContain("Opening Time: 08:00:00");
+    expect(details.get("Hours of operation")).toContain("All Day: true");
+    expect(details.get("Endpoints")).toContain("Reference: Endpoint/endpoint-1");
+    expect(details.get("Narrative")).toContain("<img src=x onerror=alert(1)>");
+    expect(details.get("Epic Custom Location Field (epicCustomLocationField)")).toContain(
+      "Wheelchair Accessible: true",
+    );
+    const detailValues = card?.children.find((child) => child.tagName === "DL")?.children
+      .filter((child) => child.tagName === "DD") ?? [];
+    expect(detailValues.every((detail) => detail.className === "location-field-value")).toBe(true);
+    expect(harness.elements["#result-list"].hidden).toBe(true);
+    expect(harness.elements["#result"].textContent).toBe(JSON.stringify({
+      resourceType: "Bundle",
+      type: "searchset",
+      entry: [{ resource: location }],
+    }, null, 2));
+
+    await harness.controls.runDataRequest("/location-direct-test", "Location details");
+    const directCard = harness.elements["#result-list"].children[0];
+    expect(directCard?.className).toBe("result-card");
+    expect(cardDetails(directCard).size).toBe(Object.keys(location).length);
+    expect(cardDetails(directCard).get("Address")).toContain("City: Boston");
+    expect(directCard?.children.find((child) => child.tagName === "DL")?.children
+      .filter((child) => child.tagName === "DD")
+      .every((detail) => detail.className === "location-field-value")).toBe(true);
+    expect(harness.elements["#result-list"].hidden).toBe(false);
   });
 
   it("graphs every sortable event on the displayed Bundle page in temporal order", async () => {
@@ -1795,6 +1996,170 @@ describe("legal pages", () => {
     expect(harness.elements["#result"].textContent).toContain(diagnostic);
   });
 
+  it("shows every field Epic returned when View profile is selected", async () => {
+    const patient = {
+      resourceType: "Patient",
+      id: "patient-1",
+      meta: {
+        versionId: "7",
+        lastUpdated: "2026-08-24T20:00:00Z",
+        profile: ["http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"],
+      },
+      implicitRules: "https://ehr.example.test/fhir/rules/patient-v1",
+      language: "en-US",
+      text: {
+        status: "generated",
+        div: '<div xmlns="http://www.w3.org/1999/xhtml"><script>not executable</script>Profile narrative</div>',
+      },
+      contained: [{ resourceType: "Organization", id: "contained-org", name: "Contained clinic" }],
+      extension: [{ url: "https://example.test/fhir/extension", valueString: "Extension value" }],
+      modifierExtension: [{ url: "https://example.test/fhir/modifier", valueBoolean: false }],
+      identifier: [{
+        use: "usual",
+        type: { text: "Medical record number" },
+        system: "urn:oid:1.2.3.4",
+        value: "MRN-123",
+      }],
+      active: true,
+      name: [
+        { use: "official", given: ["Pat", "Q"], family: "Example" },
+        { use: "nickname", text: "Patsy" },
+      ],
+      telecom: [{ system: "phone", value: "555-0100", use: "mobile", rank: 1 }],
+      gender: "female",
+      birthDate: "1980-01-02",
+      deceasedBoolean: false,
+      address: [{
+        use: "home",
+        line: ["1 Main Street"],
+        city: "Boston",
+        state: "MA",
+        postalCode: "02108",
+      }],
+      maritalStatus: { text: "Married" },
+      multipleBirthInteger: 2,
+      photo: [{ contentType: "image/png", title: "Profile photo", data: "aW1hZ2U=" }],
+      contact: [{
+        relationship: [{ text: "Emergency contact" }],
+        name: { text: "Alex Example" },
+        telecom: [{ system: "email", value: "alex@example.test" }],
+      }],
+      communication: [{ language: { text: "English" }, preferred: true }],
+      generalPractitioner: [{
+        reference: "Practitioner/practitioner-1",
+        display: "Dr Ada Example",
+      }],
+      managingOrganization: {
+        reference: "Organization/organization-1",
+        display: "Example Health",
+      },
+      link: [{ other: { reference: "Patient/patient-2" }, type: "replaces" }],
+      epicCustomProfileField: {
+        nestedValue: 0,
+        enabled: false,
+        emptyText: "",
+        unavailable: null,
+        emptyList: [],
+        emptyObject: {},
+      },
+    };
+    let patientRequest: RequestInit | undefined;
+    const harness = createBrowserHarness(async (path, options) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/Patient.r"],
+          capabilities: [{
+            resourceType: "Patient",
+            read: true,
+            readConstraintAlternatives: [[]],
+            search: false,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/api/patient") {
+        patientRequest = options;
+        return jsonResponse(patient);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.elements["#patient"].dispatch("click");
+
+    expect(new Headers(patientRequest?.headers).get("X-Epic-Expected-Connection-Context")).toBe(
+      connectionContextA,
+    );
+    const card = harness.elements["#result-list"].children[0];
+    expect(card?.tagName).toBe("ARTICLE");
+    expect(card?.className).toBe("result-card");
+    expect(card?.getAttribute("role")).toBe("listitem");
+    expect(card?.children.find((child) => child.className === "resource-kind")?.textContent).toBe(
+      "Patient",
+    );
+    expect(card?.children.find((child) => child.tagName === "H3")?.textContent).toBe("Patient profile");
+    const semanticsWarning = card?.children.find((child) =>
+      child.className.includes("patient-profile-warning")
+    );
+    expect(semanticsWarning?.textContent).toContain("has not interpreted");
+    expect(semanticsWarning?.getAttribute("role")).toBe("note");
+    expect(card?.children.find((child) => child.className === "patient-profile-note")?.textContent).toContain(
+      "Every field returned by Epic",
+    );
+
+    const details = cardDetails(card);
+    expect(details.size).toBe(Object.keys(patient).length);
+    expect(details.get("Resource type")).toBe("Patient");
+    expect(details.get("FHIR resource ID")).toBe("patient-1");
+    expect(details.get("Record metadata")).toContain("Version Id: 7");
+    expect(details.get("Implicit rules")).toBe("https://ehr.example.test/fhir/rules/patient-v1");
+    expect(details.get("Language")).toBe("en-US");
+    expect(details.get("Contained resources")).toContain("Name: Contained clinic");
+    expect(details.get("Extensions")).toContain("Value String: Extension value");
+    expect(details.get("Modifier extensions")).toContain("Value Boolean: false");
+    expect(details.get("Identifiers")).toContain("Value: MRN-123");
+    expect(details.get("Active")).toBe("true");
+    expect(details.get("Names")).toContain("Family: Example");
+    expect(details.get("Names")).toContain("Text: Patsy");
+    expect(details.get("Contact details")).toContain("Value: 555-0100");
+    expect(details.get("Date of birth")).toContain("(1980-01-02)");
+    expect(details.get("Administrative gender")).toBe("Female");
+    expect(details.get("Deceased")).toBe("false");
+    expect(details.get("Addresses")).toContain("Postal Code: 02108");
+    expect(details.get("Marital status")).toContain("Text: Married");
+    expect(details.get("Birth order")).toBe("2");
+    expect(details.get("Photos")).toContain("Data: aW1hZ2U=");
+    expect(details.get("Contacts")).toContain("Name:\n    Text: Alex Example");
+    expect(details.get("Contacts")).toContain("Value: alex@example.test");
+    expect(details.get("Communication preferences")).toContain("Preferred: true");
+    expect(details.get("General practitioners")).toContain("Display: Dr Ada Example");
+    expect(details.get("Managing organization")).toContain("Display: Example Health");
+    expect(details.get("Linked patient records")).toContain("Reference: Patient/patient-2");
+    expect(details.get("Narrative")).toContain("<script>not executable</script>");
+    const customField = details.get("Epic Custom Profile Field (epicCustomProfileField)");
+    expect(customField).toContain("Nested Value: 0");
+    expect(customField).toContain("Enabled: false");
+    expect(customField).toContain("Empty Text: (empty string)");
+    expect(customField).toContain("Unavailable: (null)");
+    expect(customField).toContain("Empty List:\n  (empty list)");
+    expect(customField).toContain("Empty Object:\n  (empty object)");
+    const patientValues = card?.children.find((child) => child.tagName === "DL")?.children
+      .filter((child) => child.tagName === "DD") ?? [];
+    expect(patientValues.every((detail) => detail.className === "patient-field-value")).toBe(true);
+    expect(harness.elements["#result-list"].hidden).toBe(false);
+    expect(harness.elements["#temporal-graph"].hidden).toBe(true);
+    expect(harness.elements["#advanced-result"].hidden).toBe(false);
+    expect(harness.elements["#advanced-result"].open).toBe(false);
+    expect(harness.elements["#result"].textContent).toBe(JSON.stringify(patient, null, 2));
+    expect(harness.elements["#result-status"].textContent).toContain(
+      "Every field returned by Epic is shown below",
+    );
+  });
+
   it("preserves partial FHIR dates and renders false, zero, and range values", async () => {
     let patientRead = 0;
     const harness = createBrowserHarness(async (path) => {
@@ -1852,16 +2217,20 @@ describe("legal pages", () => {
 
     await harness.controls.refreshStatus();
     await harness.controls.runDataRequest("/api/patient", "Patient profile");
-    let patientDetails = harness.elements["#result-list"].children[0]?.children.find(
-      (child) => child.tagName === "DL",
+    let patientCard = harness.elements["#result-list"].children[0];
+    expect(patientCard?.children.find((child) => child.tagName === "H3")?.textContent).toBe(
+      "Example Patient",
     );
-    expect(patientDetails?.children.find((child) => child.tagName === "DD")?.textContent).toBe("1980");
+    expect(patientCard?.children.some((child) =>
+      child.className.includes("patient-profile-warning")
+    )).toBe(false);
+    let patientDetails = cardDetails(patientCard);
+    expect(patientDetails.get("Date of birth")).toBe("1980");
 
     await harness.controls.runDataRequest("/api/patient", "Patient profile");
-    patientDetails = harness.elements["#result-list"].children[0]?.children.find(
-      (child) => child.tagName === "DL",
-    );
-    const monthOnly = patientDetails?.children.find((child) => child.tagName === "DD")?.textContent ?? "";
+    patientCard = harness.elements["#result-list"].children[0];
+    patientDetails = cardDetails(patientCard);
+    const monthOnly = patientDetails.get("Date of birth") ?? "";
     expect(monthOnly).toContain("1980");
     expect(monthOnly).not.toContain(",");
 

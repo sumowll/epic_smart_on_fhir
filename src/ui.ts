@@ -555,9 +555,14 @@ select, input { width: 100%; border: 1px solid #c8d7db; border-radius: 9px; back
 .result-card { padding: 16px; border: 1px solid #d8e3e7; border-radius: 12px; background: #fbfdfd; }
 .result-card .resource-kind { margin: 0 0 5px; color: #08786e; font-size: .72rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .result-card h3 { margin: 0; color: #15313a; font-size: 1.05rem; }
+.resource-semantics-warning { margin: 10px 0 0; }
+.patient-profile-note { margin: 10px 0 0; color: #526c74; font-size: .9rem; line-height: 1.5; }
 .result-card dl { display: grid; grid-template-columns: minmax(100px, auto) 1fr; gap: 5px 14px; margin: 12px 0 0; }
 .result-card dt { color: #5d747b; font-size: .84rem; font-weight: 750; }
 .result-card dd { min-width: 0; margin: 0; color: #36545d; overflow-wrap: anywhere; }
+.result-card dd.patient-field-value,
+.result-card dd.location-field-value,
+.timeline-event-card dd.location-field-value { white-space: pre-wrap; }
 .result-card button { margin-top: 14px; }
 .empty-result { margin: 0; padding: 16px; border: 1px dashed #c8d7db; border-radius: 12px; color: #526c74; }
 .result-warning { margin: 0; padding: 13px 15px; border-radius: 10px; background: #fff1c9; color: #704d08; line-height: 1.5; }
@@ -1387,6 +1392,9 @@ function observationValue(resource) {
 function resourceTitle(resource) {
   switch (resource.resourceType) {
     case 'Patient':
+      return resourceHasUninterpretedSemantics(resource)
+        ? 'Patient profile'
+        : humanName(resource.name) || friendlyResourceName(resource.resourceType);
     case 'Practitioner':
     case 'RelatedPerson':
       return humanName(resource.name) || friendlyResourceName(resource.resourceType);
@@ -1440,7 +1448,255 @@ function friendlyResourceName(resourceType) {
   return names[resourceType] || humanizeCode(resourceType);
 }
 
+const patientFieldOrder = [
+  'resourceType',
+  'id',
+  'meta',
+  'implicitRules',
+  'language',
+  'text',
+  'contained',
+  'extension',
+  'modifierExtension',
+  'identifier',
+  'active',
+  'name',
+  'telecom',
+  'gender',
+  'birthDate',
+  'deceasedBoolean',
+  'deceasedDateTime',
+  'address',
+  'maritalStatus',
+  'multipleBirthBoolean',
+  'multipleBirthInteger',
+  'photo',
+  'contact',
+  'communication',
+  'generalPractitioner',
+  'managingOrganization',
+  'link',
+];
+
+const patientFieldLabels = {
+  resourceType: 'Resource type',
+  id: 'FHIR resource ID',
+  meta: 'Record metadata',
+  implicitRules: 'Implicit rules',
+  language: 'Language',
+  text: 'Narrative',
+  contained: 'Contained resources',
+  extension: 'Extensions',
+  modifierExtension: 'Modifier extensions',
+  identifier: 'Identifiers',
+  active: 'Active',
+  name: 'Names',
+  telecom: 'Contact details',
+  gender: 'Administrative gender',
+  birthDate: 'Date of birth',
+  deceasedBoolean: 'Deceased',
+  deceasedDateTime: 'Date of death',
+  address: 'Addresses',
+  maritalStatus: 'Marital status',
+  multipleBirthBoolean: 'Multiple birth',
+  multipleBirthInteger: 'Birth order',
+  photo: 'Photos',
+  contact: 'Contacts',
+  communication: 'Communication preferences',
+  generalPractitioner: 'General practitioners',
+  managingOrganization: 'Managing organization',
+  link: 'Linked patient records',
+};
+
+function resourceHasUninterpretedSemantics(resource) {
+  const pending = [resource];
+  const seen = new Set();
+  let inspected = 0;
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (!value || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    inspected += 1;
+    if (inspected > 10000) return true;
+    if (!Array.isArray(value)) {
+      if (
+        Object.prototype.hasOwnProperty.call(value, 'implicitRules') &&
+        value.implicitRules !== undefined && value.implicitRules !== null
+      ) return true;
+      if (Object.prototype.hasOwnProperty.call(value, 'modifierExtension')) {
+        const modifiers = value.modifierExtension;
+        if (!Array.isArray(modifiers) || modifiers.length > 0) return true;
+      }
+    }
+    for (const item of Object.values(value)) {
+      if (item && typeof item === 'object') pending.push(item);
+    }
+  }
+  return false;
+}
+
+function indentStructuredText(value) {
+  return value.split('\\n').map((line) => '  ' + line).join('\\n');
+}
+
+function structuredResourceText(value, depth = 0) {
+  if (value === null) return '(null)';
+  if (value === undefined) return '(undefined)';
+  if (typeof value === 'string') {
+    if (value.length === 0) return '(empty string)';
+    return /^\\s+$/.test(value) ? JSON.stringify(value) : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (depth >= 12) {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return '(value could not be displayed)';
+    }
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '(empty list)';
+    return value.map((item, index) => {
+      const itemText = structuredResourceText(item, depth + 1);
+      if (item && typeof item === 'object') {
+        return String(index + 1) + '.\\n' + indentStructuredText(itemText);
+      }
+      return String(index + 1) + '. ' + itemText;
+    }).join('\\n');
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return '(empty object)';
+    return entries.map(([name, item]) => {
+      const itemText = structuredResourceText(item, depth + 1);
+      const label = humanizeCode(name) || name;
+      if ((item && typeof item === 'object') || itemText.includes('\\n')) {
+        return label + ':\\n' + indentStructuredText(itemText);
+      }
+      return label + ': ' + itemText;
+    }).join('\\n');
+  }
+  return String(value);
+}
+
+function patientFieldValue(name, value) {
+  if ((name === 'birthDate' || name === 'deceasedDateTime') && typeof value === 'string') {
+    const formatted = readableDate(value);
+    if (formatted && formatted !== value) return formatted + ' (' + value + ')';
+  }
+  if (name === 'gender' && typeof value === 'string') {
+    return humanizeCode(value) || value;
+  }
+  return structuredResourceText(value);
+}
+
+function patientResourceDetails(resource) {
+  const orderedNames = [];
+  const seen = new Set();
+  for (const name of patientFieldOrder) {
+    if (Object.prototype.hasOwnProperty.call(resource, name)) {
+      orderedNames.push(name);
+      seen.add(name);
+    }
+  }
+  for (const name of Object.keys(resource)) {
+    if (!seen.has(name)) orderedNames.push(name);
+  }
+  return orderedNames.map((name) => ({
+    label: Object.prototype.hasOwnProperty.call(patientFieldLabels, name)
+      ? patientFieldLabels[name]
+      : (humanizeCode(name) || name) + ' (' + name + ')',
+    value: patientFieldValue(name, resource[name]),
+    patientField: true,
+  }));
+}
+
+const locationFieldOrder = [
+  'resourceType',
+  'id',
+  'meta',
+  'implicitRules',
+  'language',
+  'text',
+  'contained',
+  'extension',
+  'modifierExtension',
+  'identifier',
+  'status',
+  'operationalStatus',
+  'name',
+  'alias',
+  'description',
+  'mode',
+  'type',
+  'telecom',
+  'address',
+  'physicalType',
+  'position',
+  'managingOrganization',
+  'partOf',
+  'hoursOfOperation',
+  'availabilityExceptions',
+  'endpoint',
+];
+
+const locationFieldLabels = {
+  resourceType: 'Resource type',
+  id: 'FHIR resource ID',
+  meta: 'Record metadata',
+  implicitRules: 'Implicit rules',
+  language: 'Language',
+  text: 'Narrative',
+  contained: 'Contained resources',
+  extension: 'Extensions',
+  modifierExtension: 'Modifier extensions',
+  identifier: 'Identifiers',
+  status: 'Status',
+  operationalStatus: 'Operational status',
+  name: 'Name',
+  alias: 'Aliases',
+  description: 'Description',
+  mode: 'Mode',
+  type: 'Types',
+  telecom: 'Contact details',
+  address: 'Address',
+  physicalType: 'Physical type',
+  position: 'Coordinates',
+  managingOrganization: 'Managing organization',
+  partOf: 'Parent location',
+  hoursOfOperation: 'Hours of operation',
+  availabilityExceptions: 'Availability exceptions',
+  endpoint: 'Endpoints',
+};
+
+function locationResourceDetails(resource) {
+  const orderedNames = [];
+  const seen = new Set();
+  for (const name of locationFieldOrder) {
+    if (Object.prototype.hasOwnProperty.call(resource, name)) {
+      orderedNames.push(name);
+      seen.add(name);
+    }
+  }
+  for (const name of Object.keys(resource)) {
+    if (!seen.has(name)) orderedNames.push(name);
+  }
+  return orderedNames.map((name) => ({
+    label: Object.prototype.hasOwnProperty.call(locationFieldLabels, name)
+      ? locationFieldLabels[name]
+      : (humanizeCode(name) || name) + ' (' + name + ')',
+    value: structuredResourceText(resource[name]),
+    locationField: true,
+  }));
+}
+
 function resourceDetails(resource, options = {}) {
+  if (resource.resourceType === 'Location') {
+    return locationResourceDetails(resource);
+  }
+  if (resource.resourceType === 'Patient' && options.timeline !== true) {
+    return patientResourceDetails(resource);
+  }
   const details = [];
   const add = (label, value) => {
     const text = readableText(value);
@@ -2214,6 +2470,27 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
   const title = resourceTitle(resource);
   heading.textContent = title;
   card.append(kind, heading);
+  const showSemanticsWarning = resourceHasUninterpretedSemantics(resource) && (
+    resource.resourceType === 'Location' ||
+    (resource.resourceType === 'Patient' && !isTimelineCard)
+  );
+  if (showSemanticsWarning) {
+    const semanticsWarning = document.createElement('p');
+    semanticsWarning.className = 'result-warning resource-semantics-warning' +
+      (resource.resourceType === 'Patient' ? ' patient-profile-warning' : '');
+    semanticsWarning.setAttribute('role', 'note');
+    semanticsWarning.textContent = 'This ' + friendlyResourceName(resource.resourceType) +
+      ' resource has semantics this app has not interpreted, such as modifier extensions or implicit rules, ' +
+      'or was too complex to fully assess. All source fields are displayed, but consult the applicable ' +
+      'definitions and raw FHIR JSON before relying on their meaning.';
+    card.append(semanticsWarning);
+  }
+  if (resource.resourceType === 'Patient' && !isTimelineCard) {
+    const profileNote = document.createElement('p');
+    profileNote.className = 'patient-profile-note';
+    profileNote.textContent = 'Every field returned by Epic is shown below. Fields that the healthcare organization did not supply are not listed. This Patient resource contains demographic and administrative profile data, not the complete medical record.';
+    card.append(profileNote);
+  }
   if (isTimelineCard && typeof options.dateKind === 'string' && options.dateKind) {
     const dateKind = document.createElement('p');
     dateKind.className = 'timeline-date-kind';
@@ -2228,6 +2505,8 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
       const term = document.createElement('dt');
       term.textContent = detail.label;
       const description = document.createElement('dd');
+      if (detail.patientField === true) description.className = 'patient-field-value';
+      if (detail.locationField === true) description.className = 'location-field-value';
       description.textContent = detail.value;
       list.append(term, description);
     }
@@ -2351,8 +2630,11 @@ function showResult(value, label, pageNumber, previousView) {
     ? ' Epic included ' + friendlySummary.provenanceCount + ' record source' +
       (friendlySummary.provenanceCount === 1 ? '' : 's') + '.'
     : '';
+  const displayDescription = value && typeof value === 'object' && value.resourceType === 'Patient'
+    ? ' Every field returned by Epic is shown below; complete parsed FHIR JSON remains available in Advanced.'
+    : ' A readable summary is shown below; raw FHIR JSON remains available in Advanced.';
   resultStatus.textContent = label + ' loaded.' + pageDescription + outcomeDescription + provenanceDescription +
-    ' A readable summary is shown below; raw FHIR JSON remains available in Advanced.';
+    displayDescription;
   paginationControls.replaceChildren();
   if (previousView) {
     const backButton = document.createElement('button');
@@ -2754,9 +3036,9 @@ connectForm.addEventListener('submit', async (event) => {
   }
 });
 
-patientButton.addEventListener('click', () => {
+patientButton.addEventListener('click', async () => {
   if (!patientReadAllowed || patientButton.disabled) return;
-  void runDataRequest('/api/patient', 'Patient profile');
+  await runDataRequest('/api/patient', 'Patient profile');
 });
 
 resourceType.addEventListener('change', () => {
