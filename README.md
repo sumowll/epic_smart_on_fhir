@@ -559,8 +559,13 @@ Use the trace as a decision tree:
 
 1. If a field is found in the complete application JSON but not on the friendly
    card, the UI summary omitted it. Most resource cards intentionally select a
-   small set of readable fields; Patient and Location views expand every returned
-   top-level field.
+   small set of readable fields. Patient profiles group demographics, contact
+   information, contacts, languages, care providers, known demographic extensions,
+   and provider-scoped identifiers into readable sections. Missing main fields
+   say **Not provided**; repeated display values are consolidated. Unknown
+   extensions and technical metadata remain in Advanced. Profiles with
+   uninterpreted modifiers or implicit rules show a notice instead of a summary.
+   Location views expand every returned top-level field.
 2. If a field is absent from an ordinary direct-read response, the response trace
    attests that resource fields were preserved, so Epic did not include that field
    in that read response.

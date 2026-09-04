@@ -603,6 +603,12 @@ select, input { width: 100%; border: 1px solid #c8d7db; border-radius: 9px; back
 .result-card dd.patient-field-value,
 .result-card dd.location-field-value,
 .timeline-event-card dd.location-field-value { white-space: pre-wrap; }
+.patient-profile-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+.patient-profile-section { min-width: 0; padding: 18px; border: 1px solid #d8e3e7; border-radius: 10px; background: white; }
+.patient-profile-section h4 { margin: 0; color: #15313a; font-size: .98rem; }
+.result-card .patient-profile-section dl { grid-template-columns: 1fr; gap: 4px; }
+.patient-profile-section dd + dt { margin-top: 12px; }
+.result-card dd.patient-field-missing { color: #63777d; font-style: italic; }
 .result-card button { margin-top: 14px; }
 .empty-result { margin: 0; padding: 16px; border: 1px dashed #c8d7db; border-radius: 12px; color: #526c74; }
 .result-warning { margin: 0; padding: 13px 15px; border-radius: 10px; background: #fff1c9; color: #704d08; line-height: 1.5; }
@@ -657,6 +663,7 @@ a:hover { color: #064f4a; }
 .site-footer a { font-weight: 700; }
 [hidden] { display: none !important; }
 @media (max-width: 700px) {
+  .patient-profile-sections { grid-template-columns: 1fr; }
   main { margin: 20px auto; }
   .card, .hero { padding: 22px; }
   .section-heading { align-items: flex-start; flex-direction: column; }
@@ -1376,7 +1383,7 @@ function renderResponseTrace(value, trace) {
   }
 
   const allFieldsExpanded = primaryResources.length > 0 && primaryResources.every((resource) =>
-    resource.resourceType === 'Patient' || resource.resourceType === 'Location'
+    resource.resourceType === 'Location'
   );
   if (primaryResources.length === 0) {
     responseTraceDisplay.textContent = 'No primary resource was available to summarize on this response page.';
@@ -1845,66 +1852,6 @@ function friendlyResourceName(resourceType) {
   return names[resourceType] || humanizeCode(resourceType);
 }
 
-const patientFieldOrder = [
-  'resourceType',
-  'id',
-  'meta',
-  'implicitRules',
-  'language',
-  'text',
-  'contained',
-  'extension',
-  'modifierExtension',
-  'identifier',
-  'active',
-  'name',
-  'telecom',
-  'gender',
-  'birthDate',
-  'deceasedBoolean',
-  'deceasedDateTime',
-  'address',
-  'maritalStatus',
-  'multipleBirthBoolean',
-  'multipleBirthInteger',
-  'photo',
-  'contact',
-  'communication',
-  'generalPractitioner',
-  'managingOrganization',
-  'link',
-];
-
-const patientFieldLabels = {
-  resourceType: 'Resource type',
-  id: 'FHIR resource ID',
-  meta: 'Record metadata',
-  implicitRules: 'Implicit rules',
-  language: 'Language',
-  text: 'Narrative',
-  contained: 'Contained resources',
-  extension: 'Extensions',
-  modifierExtension: 'Modifier extensions',
-  identifier: 'Identifiers',
-  active: 'Active',
-  name: 'Names',
-  telecom: 'Contact details',
-  gender: 'Administrative gender',
-  birthDate: 'Date of birth',
-  deceasedBoolean: 'Deceased',
-  deceasedDateTime: 'Date of death',
-  address: 'Addresses',
-  maritalStatus: 'Marital status',
-  multipleBirthBoolean: 'Multiple birth',
-  multipleBirthInteger: 'Birth order',
-  photo: 'Photos',
-  contact: 'Contacts',
-  communication: 'Communication preferences',
-  generalPractitioner: 'General practitioners',
-  managingOrganization: 'Managing organization',
-  link: 'Linked patient records',
-};
-
 function resourceHasUninterpretedSemantics(resource) {
   const pending = [resource];
   const seen = new Set();
@@ -1976,36 +1923,194 @@ function structuredResourceText(value, depth = 0) {
   return String(value);
 }
 
-function patientFieldValue(name, value) {
-  if ((name === 'birthDate' || name === 'deceasedDateTime') && typeof value === 'string') {
-    const formatted = readableDate(value);
-    if (formatted && formatted !== value) return formatted + ' (' + value + ')';
-  }
-  if (name === 'gender' && typeof value === 'string') {
-    return humanizeCode(value) || value;
-  }
-  return structuredResourceText(value);
+// Patient profiles use explicit mappings so implementation fields never become UI labels.
+function patientItems(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    : [];
+}
+
+function patientText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function patientUnique(values, separator = '\\n') {
+  return [...new Set(values.filter(Boolean))].join(separator);
+}
+
+function patientConcept(value) {
+  if (!value || typeof value !== 'object') return patientText(value);
+  if (patientText(value.text)) return value.text.trim();
+  if (patientText(value.display)) return value.display.trim();
+  const codings = Array.isArray(value.coding) ? patientItems(value.coding) : [value];
+  const displays = codings.map((coding) => patientText(coding.display)).filter(Boolean);
+  if (displays.length) return patientUnique(displays, ', ');
+  return patientUnique(codings.map((coding) => patientText(coding.code)
+    ? 'Code: ' + coding.code + (patientText(coding.system) ? ' (' + coding.system + ')' : '')
+    : ''), ', ');
+}
+
+function patientPeriod(period) {
+  if (!period || typeof period !== 'object') return '';
+  const start = readableDate(period.start);
+  const end = readableDate(period.end);
+  if (start && end) return start + ' – ' + end;
+  return start ? 'Since ' + start : end ? 'Until ' + end : '';
+}
+
+function patientQualified(value, qualifiers) {
+  return value ? value + (qualifiers.filter(Boolean).length ? ' (' + qualifiers.filter(Boolean).join('; ') + ')' : '') : '';
+}
+
+function patientName(name) {
+  return patientQualified(humanName(name), [
+    patientText(name.use) ? humanizeCode(name.use) : '',
+    patientPeriod(name.period),
+  ]);
+}
+
+function patientTelecom(item) {
+  return patientQualified(patientText(item.value), [
+    patientText(item.use) ? humanizeCode(item.use) : '',
+    Number.isInteger(item.rank) && item.rank > 0 ? 'Priority ' + item.rank : '',
+    patientPeriod(item.period),
+  ]);
+}
+
+function patientAddress(address) {
+  const lines = Array.isArray(address.line) ? address.line.map(patientText).filter(Boolean) : [];
+  const city = [patientText(address.city), patientText(address.state), patientText(address.postalCode)].filter(Boolean).join(' ');
+  const value = patientText(address.text) || [...lines, city, patientText(address.district), patientText(address.country)].filter(Boolean).join(', ');
+  return patientQualified(value, [
+    patientText(address.use) ? humanizeCode(address.use) : '',
+    patientText(address.type) ? humanizeCode(address.type) : '',
+    patientPeriod(address.period),
+  ]);
+}
+
+function patientIdentifier(identifier) {
+  const value = patientText(identifier?.value);
+  if (!value) return '';
+  const label = patientConcept(identifier.type);
+  return patientQualified((label ? label + ': ' : '') + value, [
+    patientText(identifier.assigner?.display),
+    patientText(identifier.assigner?.reference),
+    patientQualified(patientText(identifier.assigner?.identifier?.value), [patientText(identifier.assigner?.identifier?.system)]),
+    patientText(identifier.system),
+    patientText(identifier.use) ? humanizeCode(identifier.use) : '',
+    patientPeriod(identifier.period),
+  ]);
+}
+
+function patientReferenceName(reference, resource) {
+  if (patientText(reference?.display)) return reference.display.trim();
+  const ref = patientText(reference?.reference);
+  const contained = ref.startsWith('#')
+    ? patientItems(resource.contained).find((item) => item.id === ref.slice(1))
+    : undefined;
+  return contained ? humanName(contained.name) || 'Name not provided' : 'Name not provided';
+}
+
+function patientReferenceId(reference) {
+  return [patientText(reference?.reference), patientIdentifier(reference?.identifier)].filter(Boolean).join(' · ');
+}
+
+function patientExtensionText(extension) {
+  const direct = patientConcept(extension.valueCodeableConcept || extension.valueCoding) ||
+    patientText(extension.valueString) || patientText(extension.valueCode);
+  if (direct) return direct;
+  const nested = patientItems(extension.extension);
+  // Only interpret known child fields; other extension content stays in Advanced.
+  const values = nested.filter((item) => ['text', 'ombCategory', 'detailed', 'value'].includes(item.url))
+    .map((item) => patientConcept(item.valueCodeableConcept || item.valueCoding) || patientText(item.valueString) || patientText(item.valueCode));
+  return patientQualified(patientUnique(values, ', '), [
+    ...nested.filter((item) => item.url === 'period').map((item) => patientPeriod(item.valuePeriod)),
+  ]);
 }
 
 function patientResourceDetails(resource) {
-  const orderedNames = [];
-  const seen = new Set();
-  for (const name of patientFieldOrder) {
-    if (Object.prototype.hasOwnProperty.call(resource, name)) {
-      orderedNames.push(name);
-      seen.add(name);
+  if (resourceHasUninterpretedSemantics(resource)) return [];
+  const details = [];
+  const add = (group, label, value, required = false) => {
+    if (value || required) details.push({ group, label, value: value || 'Not provided', patientField: true });
+  };
+  const names = patientItems(resource.name);
+  add('Personal details', 'Names', patientUnique(names.map(patientName)), true);
+  add('Personal details', 'Date of birth', readableDate(resource.birthDate), true);
+  add('Personal details', 'Administrative gender', patientText(resource.gender) ? humanizeCode(resource.gender) : '', true);
+  add('Personal details', 'Marital status', patientConcept(resource.maritalStatus));
+  add('Personal details', 'Record status', typeof resource.active === 'boolean' ? (resource.active ? 'Active' : 'Inactive') : '');
+  add('Personal details', 'Deceased', typeof resource.deceasedBoolean === 'boolean' ? (resource.deceasedBoolean ? 'Yes' : 'No') : '');
+  add('Personal details', 'Date of death', readableDate(resource.deceasedDateTime));
+  add('Personal details', 'Multiple birth', typeof resource.multipleBirthBoolean === 'boolean' ? (resource.multipleBirthBoolean ? 'Yes' : 'No') : '');
+  add('Personal details', 'Birth order', Number.isInteger(resource.multipleBirthInteger) ? String(resource.multipleBirthInteger) : '');
+
+  const telecom = patientItems(resource.telecom);
+  add('Contact information', 'Phone', patientUnique(telecom.filter((item) => item.system === 'phone').map(patientTelecom)), true);
+  add('Contact information', 'Email', patientUnique(telecom.filter((item) => item.system === 'email').map(patientTelecom)), true);
+  add('Contact information', 'Addresses', patientUnique(patientItems(resource.address).map(patientAddress), '\\n\\n'), true);
+  add('Contact information', 'Other contact details', patientUnique(telecom.filter((item) => !['phone', 'email'].includes(item.system))
+    .map((item) => patientTelecom(item) ? (patientText(item.system) ? humanizeCode(item.system) + ': ' : '') + patientTelecom(item) : '')));
+
+  const contacts = patientItems(resource.contact).map((contact) => {
+    const lines = [
+      humanName(contact.name),
+      patientUnique(patientItems(contact.relationship).map(patientConcept), ', '),
+      ...patientItems(contact.telecom).map((item) => patientTelecom(item)
+        ? (patientText(item.system) ? humanizeCode(item.system) + ': ' : '') + patientTelecom(item) : ''),
+      contact.address ? patientAddress(contact.address) : '',
+      contact.organization ? patientReferenceName(contact.organization, resource) : '',
+      contact.organization ? patientReferenceId(contact.organization) : '',
+      patientPeriod(contact.period),
+    ];
+    return lines.filter(Boolean).join('\\n');
+  });
+  add('Contacts', 'Contacts', patientUnique(contacts, '\\n\\n'), true);
+  const languages = patientItems(resource.communication).map((item) => {
+    let language = patientConcept(item.language);
+    if (!patientText(item.language?.text) && !patientItems(item.language?.coding).some((coding) => patientText(coding.display))) {
+      const coding = patientItems(item.language?.coding).find((coding) => coding.system === 'urn:ietf:bcp:47' && patientText(coding.code));
+      if (coding) {
+        try { language = new Intl.DisplayNames(undefined, { type: 'language' }).of(coding.code) || language; } catch { /* Keep the source code. */ }
+      }
     }
-  }
-  for (const name of Object.keys(resource)) {
-    if (!seen.has(name)) orderedNames.push(name);
-  }
-  return orderedNames.map((name) => ({
-    label: Object.prototype.hasOwnProperty.call(patientFieldLabels, name)
-      ? patientFieldLabels[name]
-      : (humanizeCode(name) || name) + ' (' + name + ')',
-    value: patientFieldValue(name, resource[name]),
-    patientField: true,
-  }));
+    return patientQualified(language, [item.preferred === true ? 'Preferred' : '']);
+  });
+  add('Language preferences', 'Languages', patientUnique(languages), true);
+
+  const practitioners = patientItems(resource.generalPractitioner);
+  add('Care providers', 'Primary care providers', patientUnique(practitioners.map((item) => patientReferenceName(item, resource))), true);
+  add('Care providers', 'Managing organization', resource.managingOrganization ? patientReferenceName(resource.managingOrganization, resource) : '', true);
+
+  const extensions = patientItems(resource.extension);
+  const extensionValue = (urls) => patientUnique(extensions.filter((item) => urls.includes(item.url)).map(patientExtensionText));
+  const usCore = 'http://hl7.org/fhir/us/core/StructureDefinition/';
+  const epic = 'http://open.epic.com/FHIR/StructureDefinition/extension/';
+  add('Additional demographics', 'Race', extensionValue([usCore + 'us-core-race']), true);
+  add('Additional demographics', 'Ethnicity', extensionValue([usCore + 'us-core-ethnicity']), true);
+  add('Additional demographics', 'Legal sex', extensionValue([epic + 'legal-sex']), true);
+  const birthSexLabels = { F: 'Female', M: 'Male', UNK: 'Unknown' };
+  add('Additional demographics', 'Sex assigned at birth', patientUnique(extensions.filter((item) => item.url === usCore + 'us-core-birthsex')
+    .map((item) => Object.prototype.hasOwnProperty.call(birthSexLabels, item.valueCode) ? birthSexLabels[item.valueCode] : patientExtensionText(item))));
+  add('Additional demographics', 'Gender identity', extensionValue([
+    usCore + 'us-core-genderIdentity', 'http://hl7.org/fhir/StructureDefinition/patient-genderIdentity',
+    'http://hl7.org/fhir/StructureDefinition/individual-genderIdentity',
+  ]));
+  add('Additional demographics', 'Pronouns', extensionValue(['http://hl7.org/fhir/StructureDefinition/individual-pronouns']));
+  add('Additional demographics', 'Patient type', extensionValue([epic + 'patient-type']), true);
+
+  add('Record identifiers', 'Patient record ID', patientText(resource.id), true);
+  add('Record identifiers', 'Patient identifiers', patientUnique(patientItems(resource.identifier).map(patientIdentifier)), true);
+  add('Record identifiers', 'Care provider references', patientUnique(practitioners.map((item) => {
+    const id = patientReferenceId(item);
+    return id ? patientReferenceName(item, resource) + ': ' + id : '';
+  })));
+  add('Record identifiers', 'Organization reference', patientReferenceId(resource.managingOrganization));
+  add('Record identifiers', 'Linked patient records', patientUnique(patientItems(resource.link).map((item) => {
+    const id = patientReferenceId(item.other);
+    return id ? (patientText(item.type) ? humanizeCode(item.type) + ': ' : '') + id : '';
+  })));
+  return details;
 }
 
 const locationFieldOrder = [
@@ -2886,16 +2991,18 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
     semanticsWarning.className = 'result-warning resource-semantics-warning' +
       (resource.resourceType === 'Patient' ? ' patient-profile-warning' : '');
     semanticsWarning.setAttribute('role', 'note');
-    semanticsWarning.textContent = 'This ' + friendlyResourceName(resource.resourceType) +
+    semanticsWarning.textContent = resource.resourceType === 'Patient'
+      ? 'This profile includes information the app has not interpreted. A readable profile is unavailable because those details may change its meaning. The source record is available in Advanced.'
+      : 'This ' + friendlyResourceName(resource.resourceType) +
       ' resource has semantics this app has not interpreted, such as modifier extensions or implicit rules, ' +
       'or was too complex to fully assess. All source fields are displayed, but consult the applicable ' +
       'definitions and the complete application FHIR JSON before relying on their meaning.';
     card.append(semanticsWarning);
   }
-  if (resource.resourceType === 'Patient' && !isTimelineCard) {
+  if (resource.resourceType === 'Patient' && !isTimelineCard && !showSemanticsWarning) {
     const profileNote = document.createElement('p');
     profileNote.className = 'patient-profile-note';
-    profileNote.textContent = 'Every field returned by Epic is shown below. Fields that the healthcare organization did not supply are not listed. This Patient resource contains demographic and administrative profile data, not the complete medical record.';
+    profileNote.textContent = 'Profile information from your connected healthcare provider. Not provided means a detail was not included in this record.';
     card.append(profileNote);
   }
   if (isTimelineCard && typeof options.dateKind === 'string' && options.dateKind) {
@@ -2906,7 +3013,35 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
   }
 
   const details = resourceDetails(resource, options);
-  if (details.length > 0) {
+  if (resource.resourceType === 'Patient' && !isTimelineCard && details.length > 0) {
+    const sections = document.createElement('div');
+    sections.className = 'patient-profile-sections';
+    for (const group of new Set(details.map((detail) => detail.group))) {
+      const section = document.createElement('section');
+      section.className = 'patient-profile-section';
+      const sectionHeading = document.createElement('h4');
+      sectionHeading.textContent = group;
+      section.append(sectionHeading);
+      if (group === 'Record identifiers') {
+        const note = document.createElement('p');
+        note.className = 'patient-profile-note';
+        note.textContent = 'These identifiers belong to this provider’s records and may differ at other providers.';
+        section.append(note);
+      }
+      const list = document.createElement('dl');
+      for (const detail of details.filter((item) => item.group === group)) {
+        const term = document.createElement('dt');
+        term.textContent = detail.label;
+        const description = document.createElement('dd');
+        description.className = 'patient-field-value' + (detail.value === 'Not provided' ? ' patient-field-missing' : '');
+        description.textContent = detail.value;
+        list.append(term, description);
+      }
+      section.append(list);
+      sections.append(section);
+    }
+    card.append(sections);
+  } else if (details.length > 0) {
     const list = document.createElement('dl');
     for (const detail of details) {
       const term = document.createElement('dt');
@@ -3039,7 +3174,7 @@ function showResult(value, label, pageNumber, previousView, trace) {
       (friendlySummary.provenanceCount === 1 ? '' : 's') + '.'
     : '';
   const displayDescription = value && typeof value === 'object' && value.resourceType === 'Patient'
-    ? ' Every field returned by Epic is shown below; complete application FHIR JSON remains available in Advanced.'
+    ? (resourceHasUninterpretedSemantics(value) ? ' A readable profile is unavailable for this record.' : ' Your profile details are shown below.')
     : ' A readable summary is shown below; complete application FHIR JSON remains available in Advanced.';
   resultStatus.textContent = label + ' loaded.' + pageDescription + outcomeDescription + provenanceDescription +
     displayDescription;

@@ -349,16 +349,43 @@ function createBrowserHarness(
 
 function cardDetails(card: FakeElement | undefined): ReadonlyMap<string, string> {
   const details = new Map<string, string>();
-  const list = card?.children.find((child) => child.tagName === "DL");
-  if (!list) return details;
-  for (let index = 0; index + 1 < list.children.length; index += 2) {
-    const term = list.children[index];
-    const description = list.children[index + 1];
-    if (term?.tagName === "DT" && description?.tagName === "DD") {
-      details.set(term.textContent, description.textContent);
+  const visit = (element: FakeElement): void => {
+    if (element.tagName === "DL") {
+      for (let index = 0; index + 1 < element.children.length; index += 2) {
+        const term = element.children[index];
+        const description = element.children[index + 1];
+        if (term?.tagName === "DT" && description?.tagName === "DD") {
+          details.set(term.textContent, description.textContent);
+        }
+      }
     }
-  }
+    element.children.forEach(visit);
+  };
+  if (card) visit(card);
   return details;
+}
+
+async function loadPatientProfile(patient: unknown): Promise<BrowserHarness> {
+  const harness = createBrowserHarness(async (path) => {
+    if (path === "/api/connection") {
+      return jsonResponse({
+        connected: true,
+        provider: "Example Health",
+        connectionContext: connectionContextA,
+        connectedAt: "2026-08-24T20:00:00.000Z",
+        scope: ["patient/Patient.r"],
+        capabilities: [{
+          resourceType: "Patient", read: true, readConstraintAlternatives: [[]],
+          search: false, searchConstraints: [],
+        }],
+      });
+    }
+    if (path === "/api/patient") return jsonResponse(patient);
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  await harness.controls.refreshStatus();
+  await harness.controls.runDataRequest("/api/patient", "Patient profile");
+  return harness;
 }
 
 describe("legal pages", () => {
@@ -2435,72 +2462,97 @@ describe("legal pages", () => {
     expect(harness.elements["#result"].textContent).toContain(diagnostic);
   });
 
-  it("shows every field Epic returned when View profile is selected", async () => {
+  it("shows grouped patient information without exposing raw fields in the profile", async () => {
     const patient = {
       resourceType: "Patient",
-      id: "patient-1",
-      meta: {
-        versionId: "7",
-        lastUpdated: "2026-08-24T20:00:00Z",
-        profile: ["http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"],
-      },
-      implicitRules: "https://ehr.example.test/fhir/rules/patient-v1",
-      language: "en-US",
-      text: {
-        status: "generated",
-        div: '<div xmlns="http://www.w3.org/1999/xhtml"><script>not executable</script>Profile narrative</div>',
-      },
-      contained: [{ resourceType: "Organization", id: "contained-org", name: "Contained clinic" }],
-      extension: [{ url: "https://example.test/fhir/extension", valueString: "Extension value" }],
-      modifierExtension: [{ url: "https://example.test/fhir/modifier", valueBoolean: false }],
+      id: "provider-patient-1",
+      meta: { versionId: "7", profile: ["https://example.test/profile"] },
+      text: { status: "generated", div: '<div><script>not executable</script>Profile narrative</div>' },
+      extension: [
+        {
+          url: "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
+          extension: [
+            { url: "ombCategory", valueCoding: { code: "2028-9", display: "Asian" } },
+            { url: "text", valueString: "Asian" },
+          ],
+        },
+        {
+          url: "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity",
+          extension: [{ url: "text", valueString: "Not Hispanic or Latino" }],
+        },
+        {
+          url: "http://open.epic.com/FHIR/StructureDefinition/extension/legal-sex",
+          valueCodeableConcept: { text: "Female" },
+        },
+        {
+          url: "http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex",
+          valueCode: "F",
+        },
+        {
+          url: "http://hl7.org/fhir/StructureDefinition/patient-genderIdentity",
+          valueCodeableConcept: { text: "Nonbinary" },
+        },
+        {
+          url: "http://hl7.org/fhir/StructureDefinition/individual-pronouns",
+          extension: [{ url: "value", valueCodeableConcept: { text: "they/them" } }],
+        },
+        ...["Outpatient", "Self-pay", "Self-pay"].map((text) => ({
+          url: "http://open.epic.com/FHIR/StructureDefinition/extension/patient-type",
+          valueCodeableConcept: { text },
+        })),
+        { url: "https://example.test/fhir/extension", valueString: "Private custom extension" },
+      ],
       identifier: [{
         use: "usual",
         type: { text: "Medical record number" },
         system: "urn:oid:1.2.3.4",
         value: "MRN-123",
+        assigner: { display: "Example Health" },
       }],
       active: true,
       name: [
         { use: "official", given: ["Pat", "Q"], family: "Example" },
-        { use: "nickname", text: "Patsy" },
+        { use: "nickname", text: '<img src=x onerror="alert(1)">' },
       ],
-      telecom: [{ system: "phone", value: "555-0100", use: "mobile", rank: 1 }],
-      gender: "female",
+      telecom: [
+        { system: "phone", value: "555-0100", use: "mobile", rank: 1 },
+        { system: "phone", value: "555-0200", use: "work" },
+        { system: "email", value: "pat@example.test" },
+        { system: "fax", value: "555-0300" },
+      ],
+      gender: "unknown",
       birthDate: "1980-01-02",
       deceasedBoolean: false,
-      address: [{
-        use: "home",
-        line: ["1 Main Street"],
-        city: "Boston",
-        state: "MA",
-        postalCode: "02108",
-      }],
+      address: [
+        { use: "home", line: ["1 Main Street"], city: "Boston", state: "MA", postalCode: "02108" },
+        { use: "work", text: "2 Office Road\nBoston MA 02109" },
+      ],
       maritalStatus: { text: "Married" },
       multipleBirthInteger: 2,
-      photo: [{ contentType: "image/png", title: "Profile photo", data: "aW1hZ2U=" }],
-      contact: [{
-        relationship: [{ text: "Emergency contact" }],
-        name: { text: "Alex Example" },
-        telecom: [{ system: "email", value: "alex@example.test" }],
-      }],
-      communication: [{ language: { text: "English" }, preferred: true }],
-      generalPractitioner: [{
-        reference: "Practitioner/practitioner-1",
-        display: "Dr Ada Example",
-      }],
-      managingOrganization: {
-        reference: "Organization/organization-1",
-        display: "Example Health",
-      },
+      photo: [{ contentType: "image/png", data: "aW1hZ2U=" }],
+      contact: [
+        {
+          relationship: [{ text: "Spouse" }],
+          name: { text: "Alex Example" },
+          telecom: [{ system: "email", value: "alex@example.test" }],
+        },
+        {
+          relationship: [{ text: "Guardian" }],
+          name: { given: ["Robin"], family: "Example" },
+          telecom: [{ system: "phone", value: "555-0400", use: "mobile" }],
+        },
+      ],
+      communication: [
+        { language: { text: "English" }, preferred: true },
+        { language: { coding: [{ code: "es", display: "Spanish" }] }, preferred: false },
+      ],
+      generalPractitioner: [
+        { reference: "Practitioner/practitioner-1", display: "Dr Ada Example" },
+        { reference: "Organization/primary-clinic", display: "Example Primary Care" },
+      ],
+      managingOrganization: { reference: "Organization/organization-1", display: "Example Health" },
       link: [{ other: { reference: "Patient/patient-2" }, type: "replaces" }],
-      epicCustomProfileField: {
-        nestedValue: 0,
-        enabled: false,
-        emptyText: "",
-        unavailable: null,
-        emptyList: [],
-        emptyObject: {},
-      },
+      epicCustomProfileField: { nestedValue: 0, enabled: false },
     };
     let patientRequest: RequestInit | undefined;
     const harness = createBrowserHarness(async (path, options) => {
@@ -2512,11 +2564,8 @@ describe("legal pages", () => {
           connectedAt: "2026-08-24T20:00:00.000Z",
           scope: ["patient/Patient.r"],
           capabilities: [{
-            resourceType: "Patient",
-            read: true,
-            readConstraintAlternatives: [[]],
-            search: false,
-            searchConstraints: [],
+            resourceType: "Patient", read: true, readConstraintAlternatives: [[]],
+            search: false, searchConstraints: [],
           }],
         });
       }
@@ -2535,68 +2584,190 @@ describe("legal pages", () => {
     );
     const card = harness.elements["#result-list"].children[0];
     expect(card?.tagName).toBe("ARTICLE");
-    expect(card?.className).toBe("result-card");
     expect(card?.getAttribute("role")).toBe("listitem");
-    expect(card?.children.find((child) => child.className === "resource-kind")?.textContent).toBe(
-      "Patient",
-    );
-    expect(card?.children.find((child) => child.tagName === "H3")?.textContent).toBe("Patient profile");
-    const semanticsWarning = card?.children.find((child) =>
-      child.className.includes("patient-profile-warning")
-    );
-    expect(semanticsWarning?.textContent).toContain("has not interpreted");
-    expect(semanticsWarning?.getAttribute("role")).toBe("note");
-    expect(card?.children.find((child) => child.className === "patient-profile-note")?.textContent).toContain(
-      "Every field returned by Epic",
-    );
+    expect(card?.children.find((child) => child.tagName === "H3")?.textContent).toBe("Pat Q Example");
+    const sections = card?.children.find((child) => child.className === "patient-profile-sections");
+    expect(sections?.children.map((section) =>
+      section.children.find((child) => child.tagName === "H4")?.textContent
+    )).toEqual([
+      "Personal details", "Contact information", "Contacts", "Language preferences",
+      "Care providers", "Additional demographics", "Record identifiers",
+    ]);
+    expect(sections?.children.every((section) =>
+      section.tagName === "SECTION" && section.className === "patient-profile-section"
+    )).toBe(true);
 
     const details = cardDetails(card);
-    expect(details.size).toBe(Object.keys(patient).length);
-    expect(details.get("Resource type")).toBe("Patient");
-    expect(details.get("FHIR resource ID")).toBe("patient-1");
-    expect(details.get("Record metadata")).toContain("Version Id: 7");
-    expect(details.get("Implicit rules")).toBe("https://ehr.example.test/fhir/rules/patient-v1");
-    expect(details.get("Language")).toBe("en-US");
-    expect(details.get("Contained resources")).toContain("Name: Contained clinic");
-    expect(details.get("Extensions")).toContain("Value String: Extension value");
-    expect(details.get("Modifier extensions")).toContain("Value Boolean: false");
-    expect(details.get("Identifiers")).toContain("Value: MRN-123");
-    expect(details.get("Active")).toBe("true");
-    expect(details.get("Names")).toContain("Family: Example");
-    expect(details.get("Names")).toContain("Text: Patsy");
-    expect(details.get("Contact details")).toContain("Value: 555-0100");
-    expect(details.get("Date of birth")).toContain("(1980-01-02)");
-    expect(details.get("Administrative gender")).toBe("Female");
-    expect(details.get("Deceased")).toBe("false");
-    expect(details.get("Addresses")).toContain("Postal Code: 02108");
-    expect(details.get("Marital status")).toContain("Text: Married");
+    expect(details.get("Names")).toContain("Pat Q Example");
+    expect(details.get("Names")).toContain('<img src=x onerror="alert(1)">');
+    expect(details.get("Names")).not.toContain("Family:");
+    expect(details.get("Date of birth")).toContain("1980");
+    expect(details.get("Date of birth")).not.toContain("(1980-01-02)");
+    expect(details.get("Administrative gender")).toBe("Unknown");
+    expect(details.get("Marital status")).toBe("Married");
+    expect(details.get("Record status")).toBe("Active");
+    expect(details.get("Deceased")).toBe("No");
     expect(details.get("Birth order")).toBe("2");
-    expect(details.get("Photos")).toContain("Data: aW1hZ2U=");
-    expect(details.get("Contacts")).toContain("Name:\n    Text: Alex Example");
-    expect(details.get("Contacts")).toContain("Value: alex@example.test");
-    expect(details.get("Communication preferences")).toContain("Preferred: true");
-    expect(details.get("General practitioners")).toContain("Display: Dr Ada Example");
-    expect(details.get("Managing organization")).toContain("Display: Example Health");
-    expect(details.get("Linked patient records")).toContain("Reference: Patient/patient-2");
-    expect(details.get("Narrative")).toContain("<script>not executable</script>");
-    const customField = details.get("Epic Custom Profile Field (epicCustomProfileField)");
-    expect(customField).toContain("Nested Value: 0");
-    expect(customField).toContain("Enabled: false");
-    expect(customField).toContain("Empty Text: (empty string)");
-    expect(customField).toContain("Unavailable: (null)");
-    expect(customField).toContain("Empty List:\n  (empty list)");
-    expect(customField).toContain("Empty Object:\n  (empty object)");
-    const patientValues = card?.children.find((child) => child.tagName === "DL")?.children
-      .filter((child) => child.tagName === "DD") ?? [];
-    expect(patientValues.every((detail) => detail.className === "patient-field-value")).toBe(true);
+    expect(details.get("Phone")).toContain("555-0100");
+    expect(details.get("Phone")).toContain("555-0200");
+    expect(details.get("Email")).toContain("pat@example.test");
+    expect(details.get("Other contact details")).toContain("555-0300");
+    expect(details.get("Addresses")).toContain("1 Main Street");
+    expect(details.get("Addresses")).toContain("02108");
+    expect(details.get("Addresses")).toContain("2 Office Road");
+    expect(details.get("Contacts")).toContain("Spouse");
+    expect(details.get("Contacts")).toContain("Alex Example");
+    expect(details.get("Contacts")).toContain("alex@example.test");
+    expect(details.get("Contacts")).toContain("Robin Example");
+    expect(details.get("Contacts")).toContain("555-0400");
+    expect(details.get("Languages")).toContain("English");
+    expect(details.get("Languages")).toMatch(/preferred/i);
+    expect(details.get("Languages")).toContain("Spanish");
+    expect(details.get("Primary care providers")).toContain("Dr Ada Example");
+    expect(details.get("Primary care providers")).toContain("Example Primary Care");
+    expect(details.get("Managing organization")).toContain("Example Health");
+    expect(details.get("Race")).toBe("Asian");
+    expect(details.get("Ethnicity")).toBe("Not Hispanic or Latino");
+    expect(details.get("Legal sex")).toBe("Female");
+    expect(details.get("Sex assigned at birth")).toBe("Female");
+    expect(details.get("Gender identity")).toBe("Nonbinary");
+    expect(details.get("Pronouns")).toBe("they/them");
+    expect(details.get("Patient type")).toContain("Outpatient");
+    expect(details.get("Patient type")?.match(/Self-pay/g)).toHaveLength(1);
+    expect(details.get("Patient record ID")).toBe("provider-patient-1");
+    expect(details.get("Patient identifiers")).toContain("MRN-123");
+    expect(details.get("Patient identifiers")).toContain("Medical record number");
+    expect(details.get("Patient identifiers")).toContain("urn:oid:1.2.3.4");
+    expect(details.get("Patient identifiers")).not.toContain("provider-patient-1");
+    expect(details.get("Care provider references")).toContain("Practitioner/practitioner-1");
+    expect(details.get("Care provider references")).toContain("Organization/primary-clinic");
+    expect(details.get("Organization reference")).toContain("Organization/organization-1");
+    expect(details.get("Linked patient records")).toContain("Patient/patient-2");
+    expect(details.has("Record metadata")).toBe(false);
+    expect(details.has("Narrative")).toBe(false);
+    expect(details.has("Extensions")).toBe(false);
+    expect(details.has("Photos")).toBe(false);
+    expect([...details.values()].join(" ")).not.toContain("Private custom extension");
+    expect([...details.values()].join(" ")).not.toContain("not executable");
+    expect([...details.values()].join(" ")).not.toContain("nestedValue");
+    const descriptions = sections?.children.flatMap((section) =>
+      section.children.find((child) => child.tagName === "DL")?.children
+        .filter((child) => child.tagName === "DD") ?? []
+    ) ?? [];
+    expect(descriptions.length).toBeGreaterThan(0);
+    expect(descriptions.every((description) => description.children.length === 0)).toBe(true);
     expect(harness.elements["#result-list"].hidden).toBe(false);
     expect(harness.elements["#temporal-graph"].hidden).toBe(true);
     expect(harness.elements["#advanced-result"].hidden).toBe(false);
     expect(harness.elements["#advanced-result"].open).toBe(false);
     expect(harness.elements["#result"].textContent).toBe(JSON.stringify(patient, null, 2));
-    expect(harness.elements["#result-status"].textContent).toContain(
-      "Every field returned by Epic is shown below",
-    );
+    expect(harness.elements["#result-status"].textContent).not.toContain("Every field");
+    expect(harness.elements["#response-trace-display"].textContent).toContain("selective summary");
+  });
+
+  it("shows missing profile values and does not interpret lookalike extension URLs", async () => {
+    const patient = {
+      resourceType: "Patient",
+      extension: [
+        { url: "https://other.example.test/extension/legal-sex", valueString: "Invented sex" },
+        { url: "https://other.example.test/us-core-race", extension: [{ url: "text", valueString: "Invented race" }] },
+        { url: "https://other.example.test/extension/patient-type", valueString: "Invented type" },
+      ],
+    };
+    const harness = await loadPatientProfile(patient);
+
+    const details = cardDetails(harness.elements["#result-list"].children[0]);
+    for (const label of [
+      "Names", "Date of birth", "Administrative gender", "Phone", "Email", "Addresses",
+      "Contacts", "Languages", "Primary care providers", "Managing organization", "Race",
+      "Ethnicity", "Legal sex", "Patient type", "Patient record ID", "Patient identifiers",
+    ]) {
+      expect(details.get(label), label).toBe("Not provided");
+    }
+    expect(details.has("Sex assigned at birth")).toBe(false);
+    expect(details.has("Gender identity")).toBe(false);
+    expect(details.has("Pronouns")).toBe(false);
+    expect([...details.values()].join(" ")).not.toContain("Invented");
+    expect(harness.elements["#result"].textContent).toContain("Invented race");
+  });
+
+  it("retains references without provider names and supports identifiers without literal references", async () => {
+    const patient = {
+      resourceType: "Patient",
+      id: "record-with-references",
+      generalPractitioner: [
+        { reference: "Practitioner/unresolved-practitioner" },
+        { reference: "PractitionerRole/unresolved-role" },
+        { identifier: { system: "urn:example:clinician", value: "CLINICIAN-456" } },
+      ],
+      managingOrganization: { reference: "Organization/unresolved-organization" },
+      contact: [{ organization: { display: "Community support office" } }],
+      address: [{ district: "Example County" }],
+    };
+    const harness = await loadPatientProfile(patient);
+
+    const details = cardDetails(harness.elements["#result-list"].children[0]);
+    const allDetails = [...details.values()].join(" ");
+    expect(details.get("Care provider references")).toContain("Practitioner/unresolved-practitioner");
+    expect(details.get("Care provider references")).toContain("PractitionerRole/unresolved-role");
+    expect(details.get("Organization reference")).toContain("Organization/unresolved-organization");
+    expect(allDetails).toContain("CLINICIAN-456");
+    expect(details.get("Contacts")).toContain("Community support office");
+    expect(details.get("Addresses")).toBe("Example County");
+    expect(allDetails).not.toContain("[object Object]");
+  });
+
+  it.each([
+    { name: "reference-only assigners", assignerName: undefined, identifierOnly: false },
+    { name: "assigners with the same display", assignerName: "Example Health", identifierOnly: false },
+    { name: "identifier-only assigners", assignerName: "Example Health", identifierOnly: true },
+  ])("keeps identical identifier values separate by assigning organization: $name", async ({ assignerName, identifierOnly }) => {
+    const patient = {
+      resourceType: "Patient",
+      id: "record-with-scoped-identifiers",
+      identifier: ["clinic-a", "clinic-b"].map((id) => ({
+        value: "MRN-123",
+        assigner: {
+          display: assignerName,
+          reference: identifierOnly ? undefined : "Organization/" + id,
+          identifier: identifierOnly ? { system: "urn:example:clinic", value: id } : undefined,
+        },
+      })),
+    };
+    const harness = await loadPatientProfile(patient);
+
+    const details = cardDetails(harness.elements["#result-list"].children[0]);
+    const identifiers = details.get("Patient identifiers") ?? "";
+    expect(identifiers).toContain(identifierOnly ? "clinic-a" : "Organization/clinic-a");
+    expect(identifiers).toContain(identifierOnly ? "clinic-b" : "Organization/clinic-b");
+    if (identifierOnly) expect(identifiers).toContain("urn:example:clinic");
+    expect(identifiers.match(/MRN-123/g)).toHaveLength(2);
+    if (assignerName) expect(identifiers).toContain(assignerName);
+  });
+
+  it.each([
+    { implicitRules: "https://ehr.example.test/rules/patient-v1" },
+    { modifierExtension: [{ url: "https://example.test/modifier", valueBoolean: false }] },
+    { contact: [{ modifierExtension: [{ url: "https://example.test/contact-modifier", valueBoolean: true }] }] },
+  ])("suppresses interpreted patient details when source semantics are unknown: %j", async (semantics) => {
+    const patient = {
+      resourceType: "Patient",
+      id: "patient-with-rules",
+      name: [{ text: "Interpretable Only With Rules" }],
+      gender: "female",
+      ...semantics,
+    };
+    const harness = await loadPatientProfile(patient);
+
+    const card = harness.elements["#result-list"].children[0];
+    expect(card?.children.find((child) => child.tagName === "H3")?.textContent).toBe("Patient profile");
+    const warning = card?.children.find((child) => child.className.includes("patient-profile-warning"));
+    expect(warning?.textContent).toContain("has not interpreted");
+    expect(warning?.getAttribute("role")).toBe("note");
+    expect(cardDetails(card).size).toBe(0);
+    expect(card?.children.some((child) => child.className === "patient-profile-sections")).toBe(false);
+    expect(harness.elements["#result"].textContent).toBe(JSON.stringify(patient, null, 2));
+    expect(harness.elements["#advanced-result"].open).toBe(false);
   });
 
   it("preserves partial FHIR dates and renders false, zero, and range values", async () => {
