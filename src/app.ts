@@ -608,6 +608,7 @@ async function configureApp(
     const result = await service.readPatientBound(
       sessionId,
       expectedConnectionContext(request),
+      request.id,
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
     applyFhirResponseTraceHeaders(reply, "Patient", "read");
@@ -634,6 +635,7 @@ async function configureApp(
       sessionId,
       cursors[0],
       expectedConnectionContext(request),
+      request.id,
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
     applyFhirResponseTraceHeaders(reply, result.resourceType, "search");
@@ -658,6 +660,7 @@ async function configureApp(
         request.params.resourceType,
         request.params.id,
         expectedConnectionContext(request),
+        request.id,
       );
       reply.header("X-Epic-Connection-Context", result.connectionContext);
       applyFhirResponseTraceHeaders(reply, request.params.resourceType, "read");
@@ -682,6 +685,7 @@ async function configureApp(
       request.params.resourceType,
       search,
       expectedConnectionContext(request),
+      request.id,
     );
     reply.header("X-Epic-Connection-Context", result.connectionContext);
     applyFhirResponseTraceHeaders(reply, request.params.resourceType, "search");

@@ -129,8 +129,9 @@ Scope-matrix/test evidence: _________________________________________
   and auditable.
 - [ ] Branch protection and CI require reviewed commits and passing verification.
   Production cannot be deployed from an unreviewed workstation state.
-- [ ] The configuration source of truth handles checked-in `keep_vars: false`.
-  A dry-run/test deploy proves ordinary dashboard variables will not disappear.
+- [ ] The configuration source of truth handles checked-in `keep_vars: true`.
+  Preserved dashboard variables are reconciled against the approved inventory,
+  and a dry-run/test deploy proves the intended values will remain in effect.
 - [ ] Deployed ordinary variables match the approved inventory without printing
   them to build logs. No placeholder, sandbox client, sandbox endpoint, local
   callback, or example legal value remains.
@@ -223,6 +224,9 @@ Retention/recovery evidence and RPO/RTO: ____________________________
 
 ## 6. Privacy-safe logging, audit, and monitoring
 
+- [ ] `EPIC_FHIR_WIRE_LOGGING=off` in production. Any temporary diagnostic
+  exception has separate written privacy/security approval, approved test data,
+  isolated access/retention/deletion controls, and a scheduled return to `off`.
 - [ ] Automatic Worker invocation logs remain disabled, or an approved test proves
   callback query strings and all prohibited fields are redacted before ingestion.
 - [ ] Every possible logging path has been reviewed separately: application

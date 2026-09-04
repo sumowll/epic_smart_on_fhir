@@ -773,6 +773,7 @@ export class WorkerHttpApplication {
       const result = await this.service.readPatientBound(
         sessionId,
         request.headers.get("X-Epic-Expected-Connection-Context") ?? undefined,
+        requestId,
       );
       void emitAudit(productionAuditSink, {
         event: "fhir_access",
@@ -798,6 +799,7 @@ export class WorkerHttpApplication {
         sessionId,
         cursors[0],
         request.headers.get("X-Epic-Expected-Connection-Context") ?? undefined,
+        requestId,
       );
       void emitAudit(productionAuditSink, {
         event: "fhir_access",
@@ -837,6 +839,7 @@ export class WorkerHttpApplication {
           resourceType,
           id,
           request.headers.get("X-Epic-Expected-Connection-Context") ?? undefined,
+          requestId,
         );
         void emitAudit(productionAuditSink, {
           event: "fhir_access",
@@ -856,6 +859,7 @@ export class WorkerHttpApplication {
         resourceType,
         url.searchParams,
         request.headers.get("X-Epic-Expected-Connection-Context") ?? undefined,
+        requestId,
       );
       void emitAudit(productionAuditSink, {
         event: "fhir_access",

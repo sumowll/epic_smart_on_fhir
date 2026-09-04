@@ -1,0 +1,139 @@
+{
+  "resourceType": "Encounter",
+  "id": "enqdQH0W3qTjbU2dxJKhKqg3",
+  "identifier": [
+    {
+      "use": "usual",
+      "system": "urn:oid:1.2.840.114350.1.13.44.2.7.3.698084.8",
+      "value": "356614878"
+    }
+  ],
+  "status": "finished",
+  "class": {
+    "system": "urn:oid:1.2.840.114350.1.72.1.7.7.10.696784.13260",
+    "code": "5",
+    "display": "Appointment"
+  },
+  "type": [
+    {
+      "coding": [
+        {
+          "system": "urn:oid:1.2.840.114350.1.13.44.2.7.10.698084.30",
+          "code": "101",
+          "display": "Office Visit"
+        }
+      ],
+      "text": "Office Visit"
+    },
+    {
+      "coding": [
+        {
+          "system": "urn:oid:1.2.840.114350.1.13.44.2.7.2.808267",
+          "code": "4",
+          "display": "Physical"
+        }
+      ],
+      "text": "Physical"
+    },
+    {
+      "coding": [
+        {
+          "system": "http://www.ama-assn.org/go/cpt",
+          "code": "99395",
+          "display": "WELL ADULT:EST:18-39 YRS OLD"
+        }
+      ],
+      "text": "WELL ADULT:EST:18-39 YRS OLD"
+    }
+  ],
+  "subject": {
+    "reference": "Patient/ekw0Y-H3a6nPj9kcsn2dcW2ZEXII3YdhhOny3J4pTcG43",
+    "display": "Mowll, Su"
+  },
+  "participant": [
+    {
+      "type": [
+        {
+          "text": "losAuthorizingPhysician"
+        }
+      ],
+      "individual": {
+        "reference": "Practitioner/ek-LiRTmfNs4-E1ZdAeRCRQ3",
+        "type": "Practitioner",
+        "display": "Sharon Shung, MD"
+      }
+    },
+    {
+      "extension": [
+        {
+          "valueCodeableConcept": {
+            "coding": [
+              {
+                "system": "urn:oid:1.2.840.114350.1.13.44.2.7.4.698084.18832",
+                "code": "115",
+                "display": "Internal Medicine"
+              }
+            ],
+            "text": "Internal Medicine"
+          },
+          "url": "http://open.epic.com/FHIR/StructureDefinition/extension/specialty"
+        }
+      ],
+      "period": {
+        "start": "2026-08-10T12:10:58Z",
+        "end": "2026-08-10T12:36:13Z"
+      },
+      "individual": {
+        "reference": "Practitioner/ek-LiRTmfNs4-E1ZdAeRCRQ3",
+        "type": "Practitioner",
+        "display": "Sharon Shung, MD"
+      }
+    },
+    {
+      "type": [
+        {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+              "code": "PART",
+              "display": "Participation"
+            }
+          ],
+          "text": "Participation"
+        }
+      ],
+      "period": {
+        "start": "2026-08-10T12:00:00Z",
+        "end": "2026-08-10T12:40:00Z"
+      },
+      "individual": {
+        "reference": "Practitioner/ek-LiRTmfNs4-E1ZdAeRCRQ3",
+        "display": "Sharon Shung, MD"
+      }
+    }
+  ],
+  "period": {
+    "start": "2026-08-10T12:00:00Z",
+    "end": "2026-08-10T12:40:00Z"
+  },
+  "reasonCode": [
+    {
+      "coding": [
+        {
+          "system": "urn:oid:1.2.840.114350.1.13.44.2.7.2.728286",
+          "code": "112",
+          "display": "Complete Physical Exam"
+        }
+      ],
+      "text": "Complete Physical Exam"
+    }
+  ],
+  "location": [
+    {
+      "location": {
+        "reference": "Location/ek11nYKHL7C1hlnHJPE4BfQ3",
+        "display": "Concord Internal Medicine C"
+      }
+    }
+  ]
+}

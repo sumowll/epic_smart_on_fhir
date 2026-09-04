@@ -194,27 +194,31 @@ describe("Cloudflare Worker HTTP application", () => {
     });
     const sessionId = "t".repeat(43);
     const connectionContext = "c".repeat(43);
+    const readPatientBound = vi.fn(async () => ({
+      value: { resourceType: "Patient", id: "patient-private" },
+      connectionContext,
+    }));
+    const readBound = vi.fn(async () => ({
+      value: { resourceType: "Condition", id: "condition-private" },
+      connectionContext,
+    }));
+    const searchBound = vi.fn(async (_sessionId: string, resourceType: string) => ({
+      value: { resourceType: "Bundle", type: "searchset", entry: [] },
+      connectionContext,
+      resourceType,
+    }));
+    const pageBound = vi.fn(async () => ({
+      value: { resourceType: "Bundle", type: "searchset", entry: [] },
+      connectionContext,
+      resourceType: "Condition",
+    }));
     const service = {
       config,
       startAuthorization: vi.fn(async () => "https://ehr.example.test/authorize"),
-      readPatientBound: vi.fn(async () => ({
-        value: { resourceType: "Patient", id: "patient-private" },
-        connectionContext,
-      })),
-      readBound: vi.fn(async () => ({
-        value: { resourceType: "Condition", id: "condition-private" },
-        connectionContext,
-      })),
-      searchBound: vi.fn(async (_sessionId: string, resourceType: string) => ({
-        value: { resourceType: "Bundle", type: "searchset", entry: [] },
-        connectionContext,
-        resourceType,
-      })),
-      pageBound: vi.fn(async () => ({
-        value: { resourceType: "Bundle", type: "searchset", entry: [] },
-        connectionContext,
-        resourceType: "Condition",
-      })),
+      readPatientBound,
+      readBound,
+      searchBound,
+      pageBound,
     } as unknown as EpicConnectorService;
     const app = new WorkerHttpApplication(service);
 
@@ -247,6 +251,11 @@ describe("Cloudflare Worker HTTP application", () => {
       resourceType: "Patient",
       transforms: "json-parsed,validated",
     });
+    expect(readPatientBound).toHaveBeenCalledWith(
+      sessionId,
+      connectionContext,
+      patient.headers.get("x-request-id"),
+    );
 
     const read = await app.fetch(
       new Request(
@@ -263,6 +272,13 @@ describe("Cloudflare Worker HTTP application", () => {
       resourceType: "Condition",
       transforms: "json-parsed,validated",
     });
+    expect(readBound).toHaveBeenCalledWith(
+      sessionId,
+      "Condition",
+      "condition-private",
+      connectionContext,
+      read.headers.get("x-request-id"),
+    );
 
     const search = await app.fetch(
       new Request(
@@ -279,6 +295,14 @@ describe("Cloudflare Worker HTTP application", () => {
       resourceType: "Condition",
       transforms: "json-parsed,validated,bundle-links-rewritten",
     });
+    expect(searchBound).toHaveBeenNthCalledWith(
+      1,
+      sessionId,
+      "Condition",
+      expect.any(URLSearchParams),
+      connectionContext,
+      search.headers.get("x-request-id"),
+    );
 
     const page = await app.fetch(
       new Request(
@@ -295,6 +319,12 @@ describe("Cloudflare Worker HTTP application", () => {
       resourceType: "Condition",
       transforms: "json-parsed,validated,bundle-links-rewritten",
     });
+    expect(pageBound).toHaveBeenCalledWith(
+      sessionId,
+      "private-cursor",
+      connectionContext,
+      page.headers.get("x-request-id"),
+    );
 
     const locations = await app.fetch(
       new Request(
@@ -312,6 +342,14 @@ describe("Cloudflare Worker HTTP application", () => {
       transforms:
         "json-parsed,validated,derived-from-encounter-references,bundle-generated",
     });
+    expect(searchBound).toHaveBeenNthCalledWith(
+      2,
+      sessionId,
+      "Location",
+      expect.any(URLSearchParams),
+      connectionContext,
+      locations.headers.get("x-request-id"),
+    );
 
     const traceValues = [patient, read, search, page, locations]
       .flatMap((response) => [...response.headers.entries()])

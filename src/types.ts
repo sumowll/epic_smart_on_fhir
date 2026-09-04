@@ -5,6 +5,8 @@ export type TokenAuthMethod =
   | "private_key_jwt"
   | "none";
 
+export type FhirWireLoggingMode = "off" | "errors" | "all";
+
 export interface AppConfig {
   readonly legalName: string;
   readonly legalContactEmail: string;
@@ -14,6 +16,7 @@ export interface AppConfig {
   readonly clientSecret?: string;
   readonly tokenAuthMethod: TokenAuthMethod;
   readonly fhirBaseUrl: string;
+  readonly fhirWireLogging: FhirWireLoggingMode;
   readonly providerName: string;
   readonly redirectUri: string;
   readonly publicOrigin: string;

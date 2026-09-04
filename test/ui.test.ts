@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { EPIC_CARE_PLAN_SEARCH_TYPES } from "../src/care-plan.js";
 import {
   browserScript,
   renderError,
@@ -170,6 +171,9 @@ function createBrowserHarness(
     "#resource-type",
     "#resource-id-control",
     "#resource-id",
+    "#careplan-type-control",
+    "#careplan-type",
+    "#careplan-type-hint",
     "#search-constraints",
     "#search-constraint-fields",
     "#search-constraint-hint",
@@ -211,6 +215,9 @@ function createBrowserHarness(
   const conditionOption = new FakeElement("option");
   conditionOption.value = "Condition";
   conditionOption.textContent = "Conditions and health concerns";
+  const carePlanOption = new FakeElement("option");
+  carePlanOption.value = "CarePlan";
+  carePlanOption.textContent = "Care plans";
   const observationOption = new FakeElement("option");
   observationOption.value = "Observation";
   observationOption.textContent = "Labs, vital signs, and observations";
@@ -220,7 +227,7 @@ function createBrowserHarness(
   provenanceOption.setAttribute("data-interaction", "read");
   const profileGroup = new FakeElement("optgroup");
   profileGroup.setAttribute("label", "Profile and care");
-  profileGroup.append(conditionOption);
+  profileGroup.append(carePlanOption, conditionOption);
   const resultsGroup = new FakeElement("optgroup");
   resultsGroup.setAttribute("label", "Results");
   resultsGroup.append(observationOption);
@@ -229,7 +236,24 @@ function createBrowserHarness(
   recordHistoryGroup.append(provenanceOption);
   elements["#resource-type"].value = "Observation";
   elements["#resource-type"].children = [profileGroup, resultsGroup, recordHistoryGroup];
-  elements["#resource-type"].options = [conditionOption, observationOption, provenanceOption];
+  elements["#resource-type"].options = [
+    carePlanOption,
+    conditionOption,
+    observationOption,
+    provenanceOption,
+  ];
+  const carePlanPlaceholder = new FakeElement("option");
+  carePlanPlaceholder.value = "";
+  carePlanPlaceholder.textContent = "Choose a care plan type";
+  const carePlanTypeOptions = EPIC_CARE_PLAN_SEARCH_TYPES.map((type) => {
+    const option = new FakeElement("option");
+    option.value = type.category;
+    option.textContent = `${type.label} — ${type.description}`;
+    return option;
+  });
+  elements["#careplan-type"].children = [carePlanPlaceholder, ...carePlanTypeOptions];
+  elements["#careplan-type"].options = [carePlanPlaceholder, ...carePlanTypeOptions];
+  elements["#careplan-type"].value = "";
   elements["#count"].value = "20";
   elements["#legal-consent-checkbox"].value = "accepted";
   elements["#policy-version"].value = "2026-08-23";
@@ -368,6 +392,12 @@ describe("legal pages", () => {
     expect(html).toContain('<optgroup label="Results">');
     expect(html).toContain('Conditions and health concerns');
     expect(html).toContain('Labs, vital signs, and observations');
+    expect(html).toContain('<label for="careplan-type">Care plan type</label>');
+    expect(html).toContain('<option value="38717003">Longitudinal — ongoing care plan</option>');
+    expect(html).toContain('<option value="734163000">Encounter-level — visit assessment and plan</option>');
+    expect(html).toContain('<option value="736271009">Outpatient — ambulatory care plan</option>');
+    expect(html).toContain('<option value="738906000">Dental — dental treatment plan</option>');
+    expect(html).toContain('<option value="assess-plan">Outside record — imported assessment and plan</option>');
     expect(html).toContain('Response trace: where information can go missing');
     expect(html).toContain('id="field-check-form"');
     expect(html).toContain('Advanced: complete application FHIR JSON');
@@ -582,6 +612,87 @@ describe("legal pages", () => {
     expect(harness.elements["#advanced-result"].hidden).toBe(false);
     expect(harness.elements["#result"].textContent).toBe(JSON.stringify(provenance, null, 2));
     expect(harness.elements["#result-status"].textContent).toContain("Record sources loaded");
+  });
+
+  it.each(EPIC_CARE_PLAN_SEARCH_TYPES)(
+    "submits the Epic category for the $label CarePlan choice",
+    async ({ category, label, description }) => {
+      let requestedPath = "";
+      let requestHeaders = new Headers();
+      const harness = createBrowserHarness(async (path, options) => {
+        if (path === "/api/connection") {
+          return jsonResponse({
+            connected: true,
+            provider: "Example Health",
+            connectionContext: connectionContextA,
+            connectedAt: "2026-08-24T20:00:00.000Z",
+            scope: ["patient/CarePlan.s"],
+            capabilities: [{
+              resourceType: "CarePlan",
+              read: false,
+              search: true,
+              searchConstraints: [],
+            }],
+          });
+        }
+        requestedPath = path;
+        requestHeaders = new Headers(options?.headers);
+        return jsonResponse({ resourceType: "Bundle", type: "searchset", entry: [] });
+      });
+
+      await harness.controls.refreshStatus();
+
+      expect(harness.elements["#resource-type"].value).toBe("CarePlan");
+      expect(harness.elements["#careplan-type-control"].hidden).toBe(false);
+      expect(harness.elements["#careplan-type"].required).toBe(true);
+      expect(harness.elements["#careplan-type"].disabled).toBe(false);
+      expect(harness.elements["#search-constraints"].hidden).toBe(true);
+      expect(harness.elements["#careplan-type"].options.map((option) => option.textContent)).toContain(
+        `${label} — ${description}`,
+      );
+
+      harness.elements["#careplan-type"].value = category;
+      await harness.elements["#search-form"].dispatch("submit", {
+        preventDefault(): void {},
+      });
+
+      const requested = new URL(requestedPath, "https://connector.example.test");
+      expect(requested.pathname).toBe("/api/fhir/CarePlan");
+      expect(requested.searchParams.get("_count")).toBe("20");
+      expect(requested.searchParams.getAll("category")).toEqual([category]);
+      expect(requestHeaders.get("X-Epic-Expected-Connection-Context")).toBe(connectionContextA);
+    },
+  );
+
+  it("requires a CarePlan type before issuing a search", async () => {
+    let carePlanRequests = 0;
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/CarePlan.s"],
+          capabilities: [{
+            resourceType: "CarePlan",
+            read: false,
+            search: true,
+            searchConstraints: [],
+          }],
+        });
+      }
+      carePlanRequests += 1;
+      return jsonResponse({ resourceType: "Bundle", type: "searchset", entry: [] });
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.elements["#search-form"].dispatch("submit", {
+      preventDefault(): void {},
+    });
+
+    expect(carePlanRequests).toBe(0);
+    expect(harness.elements["#result-error"].textContent).toContain("Choose a care plan type");
   });
 
   it("renders friendly constrained-search choices and submits the exact authorized value", async () => {

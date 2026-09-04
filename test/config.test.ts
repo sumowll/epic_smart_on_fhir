@@ -28,6 +28,27 @@ describe("configuration", () => {
     expect(config.allowedResourceTypes).toEqual(new Set(["Condition", "Observation"]));
   });
 
+  it("keeps FHIR wire logging off by default and accepts explicit bounded modes", () => {
+    const environment = validEnvironment();
+    delete environment.EPIC_FHIR_WIRE_LOGGING;
+    expect(loadConfig(environment).fhirWireLogging).toBe("off");
+    expect(loadConfig(validEnvironment({
+      EPIC_FHIR_WIRE_LOGGING: "errors",
+    })).fhirWireLogging).toBe("errors");
+    expect(loadConfig(validEnvironment({
+      EPIC_FHIR_WIRE_LOGGING: "all",
+    })).fhirWireLogging).toBe("all");
+  });
+
+  it.each(["", "true", "debug", "ALL"])(
+    "rejects an invalid FHIR wire logging mode: %s",
+    (mode) => {
+      expect(() => loadConfig(validEnvironment({
+        EPIC_FHIR_WIRE_LOGGING: mode,
+      }))).toThrow(/EPIC_FHIR_WIRE_LOGGING/);
+    },
+  );
+
   it("derives consent and bounded local-session defaults from production configuration", () => {
     const defaults = loadConfig(validEnvironment());
     expect(defaults.consentPolicyVersion).toBe("2026-08-23");

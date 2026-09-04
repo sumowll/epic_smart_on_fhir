@@ -7,6 +7,7 @@ export interface JsonRequestOptions {
   readonly maxBytes: number;
   readonly consumeBytes?: (byteLength: number) => boolean;
   readonly onResponse?: (response: Response) => void;
+  readonly onBody?: (response: Response, body: string) => void | Promise<void>;
   readonly init?: RequestInit;
   readonly expectedStatus?: readonly number[];
 }
@@ -108,6 +109,13 @@ export async function requestJson(
   options.onResponse?.(response);
 
   const text = await readLimited(response, options.maxBytes, options.consumeBytes);
+  if (options.onBody) {
+    try {
+      await options.onBody(response, text);
+    } catch {
+      // Diagnostics must not change the upstream request outcome.
+    }
+  }
   let json: unknown;
   try {
     json = text ? JSON.parse(text) : {};

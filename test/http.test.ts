@@ -66,4 +66,55 @@ describe("requestJson", () => {
       upstreamStatus: 200,
     });
   });
+
+  it("exposes the exact bounded body before JSON parsing", async () => {
+    const body = "not-json\nwith diagnostic text";
+    const seen: Array<{ response: Response; body: string }> = [];
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 400,
+      headers: { "content-type": "text/plain" },
+    })) as FetchLike;
+
+    await expect(requestJson("https://ehr.example.test/fhir", {
+      fetch: fetchMock,
+      timeoutMs: 10_000,
+      maxBytes: 1_024,
+      expectedStatus: [400],
+      onBody: (response, responseBody) => {
+        seen.push({ response, body: responseBody });
+      },
+    })).rejects.toMatchObject({ code: "invalid_upstream_response" });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.response.status).toBe(400);
+    expect(seen[0]?.body).toBe(body);
+  });
+
+  it("swallows body-hook failures without changing a successful response", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ ok: true })) as FetchLike;
+
+    await expect(requestJson("https://ehr.example.test/fhir", {
+      fetch: fetchMock,
+      timeoutMs: 10_000,
+      maxBytes: 1_024,
+      onBody: async () => {
+        throw new Error("diagnostic sink unavailable");
+      },
+    })).resolves.toMatchObject({ json: { ok: true } });
+  });
+
+  it("does not invoke the body hook for a response rejected by the byte limit", async () => {
+    const onBody = vi.fn();
+    const fetchMock = vi.fn(async () => new Response("oversized", {
+      headers: { "content-length": "9" },
+    })) as FetchLike;
+
+    await expect(requestJson("https://ehr.example.test/fhir", {
+      fetch: fetchMock,
+      timeoutMs: 10_000,
+      maxBytes: 4,
+      onBody,
+    })).rejects.toMatchObject({ code: "upstream_too_large" });
+    expect(onBody).not.toHaveBeenCalled();
+  });
 });

@@ -79,6 +79,7 @@ interface WorkerBindings {
   readonly EPIC_CLIENT_SECRET?: string;
   readonly EPIC_TOKEN_AUTH_METHOD?: string;
   readonly EPIC_FHIR_BASE_URL?: string;
+  readonly EPIC_FHIR_WIRE_LOGGING?: string;
   readonly EPIC_PROVIDER_NAME?: string;
   readonly EPIC_REDIRECT_URI?: string;
   readonly EPIC_SCOPES?: string;
@@ -181,6 +182,7 @@ function configurationEnvironment(
     EPIC_CLIENT_SECRET: env.EPIC_CLIENT_SECRET,
     EPIC_TOKEN_AUTH_METHOD: env.EPIC_TOKEN_AUTH_METHOD,
     EPIC_FHIR_BASE_URL: env.EPIC_FHIR_BASE_URL,
+    EPIC_FHIR_WIRE_LOGGING: env.EPIC_FHIR_WIRE_LOGGING,
     EPIC_PROVIDER_NAME: env.EPIC_PROVIDER_NAME,
     EPIC_REDIRECT_URI: env.EPIC_REDIRECT_URI,
     EPIC_SCOPES: env.EPIC_SCOPES,

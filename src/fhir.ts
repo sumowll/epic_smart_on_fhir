@@ -1,4 +1,10 @@
 import { AppError, ReconnectRequiredError, UpstreamError } from "./errors.js";
+import { isEpicCarePlanSearchCategory } from "./care-plan.js";
+import {
+  emitFhirWireLogExchange,
+  productionFhirWireLogSink,
+  type FhirWireLogSink,
+} from "./fhir-wire-log.js";
 import { requestJson } from "./http.js";
 import {
   assertSmartReadResourceAuthorized,
@@ -48,6 +54,8 @@ interface FhirRequestLimits {
   readonly timeoutMs?: number;
   readonly maxBytes?: number;
   readonly consumeBytes?: (byteLength: number) => boolean;
+  /** Safe application request ID used only to correlate opt-in wire diagnostics. */
+  readonly requestId?: string;
 }
 
 type ResourceSearchStrategy = "patient" | "scope-restricted" | "reference-only";
@@ -99,6 +107,7 @@ export function serverSupportsSmartSearch(
   const advertised = new Set(advertisedParameters);
   const required = new Set(requestedParameters);
   if (strategy === "patient") required.add("patient");
+  if (resourceType === "CarePlan") required.add("category");
   required.delete("_count");
   required.delete("_sort");
   return [...required].every((name) => advertised.has(name));
@@ -539,13 +548,23 @@ export class EpicFhirClient {
   public constructor(
     private readonly config: AppConfig,
     private readonly fetch: FetchLike = globalThis.fetch,
+    private readonly fhirWireLogSink: FhirWireLogSink = productionFhirWireLogSink,
   ) {}
 
-  public async readPatient(record: ConnectionRecord): Promise<unknown> {
+  public async readPatient(
+    record: ConnectionRecord,
+    requestId?: string,
+  ): Promise<unknown> {
     const patientId = this.requireFhirId(record.patientId, "patient ID");
     this.requireFhirCapability(record, "Patient", "read");
     const grants = authorizedSmartReadGrants(record.scope, "Patient");
-    const json = await this.get(record, `Patient/${encodeURIComponent(patientId)}`, "Patient", "read");
+    const json = await this.get(
+      record,
+      `Patient/${encodeURIComponent(patientId)}`,
+      "Patient",
+      "read",
+      requestId ? { requestId } : undefined,
+    );
     const resource = validateReadResource(json, "Patient", patientId);
     assertSmartReadResourceAuthorized("Patient", resource, grants);
     return resource;
@@ -555,8 +574,14 @@ export class EpicFhirClient {
     record: ConnectionRecord,
     resourceType: string,
     id: string,
+    requestId?: string,
   ): Promise<unknown> {
-    return this.readWithLimits(record, resourceType, id);
+    return this.readWithLimits(
+      record,
+      resourceType,
+      id,
+      requestId ? { requestId } : undefined,
+    );
   }
 
   private async readWithLimits(
@@ -592,20 +617,28 @@ export class EpicFhirClient {
     record: ConnectionRecord,
     resourceType: string,
     input: URLSearchParams,
+    requestId?: string,
   ): Promise<unknown> {
-    return (await this.searchWithContext(record, resourceType, input)).bundle;
+    return (await this.searchWithContext(record, resourceType, input, requestId)).bundle;
   }
 
   public async searchWithContext(
     record: ConnectionRecord,
     resourceType: string,
     input: URLSearchParams,
+    requestId?: string,
   ): Promise<FhirSearchResult> {
     this.requireAllowedType(resourceType);
     if (resourceType === "Location") {
-      return this.searchEncounterLocationsWithContext(record, input);
+      return this.searchEncounterLocationsWithContext(record, input, requestId);
     }
-    return this.searchDirectWithContext(record, resourceType, input, true);
+    return this.searchDirectWithContext(
+      record,
+      resourceType,
+      input,
+      true,
+      requestId ? { requestId } : undefined,
+    );
   }
 
   private async searchDirectWithContext(
@@ -634,6 +667,28 @@ export class EpicFhirClient {
     }
 
     const parameters = sanitizeSearchParameters(input);
+    let carePlanCategory: string | undefined;
+    if (resourceType === "CarePlan") {
+      const categories = parameters.getAll("category");
+      if (categories.length === 0) {
+        throw new AppError(
+          400,
+          "careplan_category_required",
+          "Choose a CarePlan type before searching.",
+        );
+      }
+      if (
+        categories.length !== 1 ||
+        !isEpicCarePlanSearchCategory(categories[0]!)
+      ) {
+        throw new AppError(
+          400,
+          "careplan_category_invalid",
+          "Choose one of the supported CarePlan types before searching.",
+        );
+      }
+      carePlanCategory = categories[0]!;
+    }
     if (strategy === "patient") {
       parameters.set("patient", this.requireFhirId(record.patientId, "patient ID"));
     }
@@ -670,7 +725,12 @@ export class EpicFhirClient {
     );
     return {
       bundle: validateSearchBundle(json, resourceType, includeProvenance, record.fhirBaseUrl),
-      constraints: authorization.constraints,
+      constraints: carePlanCategory === undefined
+        ? authorization.constraints
+        : [
+            ...authorization.constraints.filter(({ name }) => name !== "category"),
+            { name: "category", value: carePlanCategory },
+          ],
       includeProvenance,
     };
   }
@@ -678,6 +738,7 @@ export class EpicFhirClient {
   private async searchEncounterLocationsWithContext(
     record: ConnectionRecord,
     input: URLSearchParams,
+    requestId?: string,
   ): Promise<FhirSearchResult> {
     const parameters = sanitizeSearchParameters(input);
     const countValues = parameters.getAll("_count");
@@ -743,6 +804,7 @@ export class EpicFhirClient {
             unconsumedReservedBytes -= byteLength;
             return true;
           },
+          ...(requestId ? { requestId } : {}),
         });
       } finally {
         remainingUpstreamBytes += unconsumedReservedBytes;
@@ -1216,9 +1278,49 @@ export class EpicFhirClient {
     interaction: "read" | "search",
     requestLimits?: FhirRequestLimits,
   ): Promise<unknown> {
+    const startedAt = Date.now();
+    const candidateRequestId = requestLimits?.requestId;
+    const requestId = candidateRequestId &&
+        /^[A-Za-z0-9._:-]{1,128}$/.test(candidateRequestId)
+      ? candidateRequestId
+      : undefined;
     let receivedResponse: Response | undefined;
+    let receivedBody: string | undefined;
     let response: Response;
     let json: unknown;
+    const emitWireLog = async (
+      outcome: "success" | "error",
+      errorCode?: string,
+    ): Promise<void> => {
+      await emitFhirWireLogExchange(
+        this.config.fhirWireLogging,
+        this.fhirWireLogSink,
+        {
+          ...(requestId ? { requestId } : {}),
+          resourceType,
+          interaction,
+          method: "GET",
+          url,
+          outcome,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          ...(receivedResponse && receivedBody !== undefined
+            ? {
+                response: {
+                  status: receivedResponse.status,
+                  ...(receivedResponse.statusText
+                    ? { statusText: receivedResponse.statusText }
+                    : {}),
+                  ...(receivedResponse.headers.get("content-type")
+                    ? { contentType: receivedResponse.headers.get("content-type")! }
+                    : {}),
+                  body: receivedBody,
+                },
+              }
+            : {}),
+          ...(errorCode ? { errorCode } : {}),
+        },
+      );
+    };
     try {
       ({ response, json } = await requestJson(url, {
         fetch: this.fetch,
@@ -1227,6 +1329,9 @@ export class EpicFhirClient {
         ...(requestLimits?.consumeBytes ? { consumeBytes: requestLimits.consumeBytes } : {}),
         onResponse: (upstreamResponse) => {
           receivedResponse = upstreamResponse;
+        },
+        onBody: (_upstreamResponse, body) => {
+          receivedBody = body;
         },
         expectedStatus: [200, 400, 401, 403, 404, 422, 429],
         init: {
@@ -1238,11 +1343,27 @@ export class EpicFhirClient {
       }));
     } catch (error) {
       if (error instanceof UpstreamError && receivedResponse && receivedResponse.status !== 200) {
-        throw fhirStatusError(receivedResponse, {}, resourceType, interaction);
+        const mappedError = fhirStatusError(
+          receivedResponse,
+          {},
+          resourceType,
+          interaction,
+        );
+        await emitWireLog("error", mappedError.code);
+        throw mappedError;
       }
+      await emitWireLog(
+        "error",
+        error instanceof AppError ? error.code : "unexpected_error",
+      );
       throw error;
     }
-    if (response.status !== 200) throw fhirStatusError(response, json, resourceType, interaction);
+    if (response.status !== 200) {
+      const error = fhirStatusError(response, json, resourceType, interaction);
+      await emitWireLog("error", error.code);
+      throw error;
+    }
+    await emitWireLog("success");
     return json;
   }
 }

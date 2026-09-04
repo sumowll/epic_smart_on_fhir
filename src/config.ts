@@ -156,6 +156,7 @@ const baseSchema = z.object({
   EPIC_FHIR_BASE_URL: z
     .string()
     .default("https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"),
+  EPIC_FHIR_WIRE_LOGGING: z.enum(["off", "errors", "all"]).default("off"),
   EPIC_PROVIDER_NAME: z.string().trim().min(1).default("Epic R4 Sandbox"),
   EPIC_REDIRECT_URI: z
     .string()
@@ -446,6 +447,7 @@ export function loadConfig(
     ...(clientSecret ? { clientSecret } : {}),
     tokenAuthMethod,
     fhirBaseUrl,
+    fhirWireLogging: env.EPIC_FHIR_WIRE_LOGGING,
     providerName: env.EPIC_PROVIDER_NAME,
     redirectUri: redirectUri.toString(),
     publicOrigin: redirectUri.origin,

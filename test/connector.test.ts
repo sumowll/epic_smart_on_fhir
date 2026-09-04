@@ -262,6 +262,127 @@ describe("Epic connector production controls", () => {
     }
   });
 
+  it("advertises CarePlan search only when Epic exposes its required category parameter", async () => {
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_SCOPES: "patient/CarePlan.s",
+      EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+    });
+
+    for (const [searchParameters, expected] of [
+      [["patient"], false],
+      [["patient", "category"], true],
+    ] as const) {
+      const store = new InMemoryConnectionStore();
+      const service = new EpicConnectorService(config, store, { now: () => now });
+      await service.initialize(false);
+      await store.set(sessionA, connection(config, `careplan-${expected}`, {
+        scope: "patient/CarePlan.s",
+        fhirCapabilities: [{
+          resourceType: "CarePlan",
+          interactions: ["search"],
+          searchParameters,
+        }],
+      }));
+
+      try {
+        const summary = await service.getConnectionSummary(sessionA);
+        const carePlan = summary.capabilities?.find(({ resourceType }) =>
+          resourceType === "CarePlan");
+        expect(carePlan?.search ?? false).toBe(expected);
+        if (expected) {
+          expect(carePlan).toMatchObject({
+            resourceType: "CarePlan",
+            read: false,
+            search: true,
+            searchConstraints: [],
+          });
+        }
+      } finally {
+        await service.close();
+      }
+    }
+  });
+
+  it("does not advertise a CarePlan grant whose category has no supported UI choice", async () => {
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_SCOPES: "patient/CarePlan.s",
+      EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+    });
+    const store = new InMemoryConnectionStore();
+    const service = new EpicConnectorService(config, store, { now: () => now });
+    await service.initialize(false);
+    await store.set(sessionA, connection(config, "unknown-careplan-category", {
+      scope: "patient/CarePlan.s?category=not-supported",
+      fhirCapabilities: [{
+        resourceType: "CarePlan",
+        interactions: ["search"],
+        searchParameters: ["patient", "category"],
+      }],
+    }));
+
+    try {
+      await expect(service.getConnectionSummary(sessionA)).resolves.toMatchObject({
+        connected: true,
+        capabilities: [],
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("seals the selected CarePlan type into its paging cursor", async () => {
+    const category = "38717003";
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_SCOPES: "patient/CarePlan.s",
+      EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+    });
+    const store = new InMemoryConnectionStore();
+    const nextUrl = `${config.fhirBaseUrl}/CarePlan?_getpages=opaque&category=${category}`;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      expect(url.searchParams.get("patient")).toBe("patient-1");
+      expect(url.searchParams.get("category")).toBe(category);
+      return jsonResponse({
+        resourceType: "Bundle",
+        type: "searchset",
+        entry: [],
+        link: [{ relation: "next", url: nextUrl }],
+      });
+    });
+    const service = new EpicConnectorService(config, store, {
+      fetch: fetchMock as FetchLike,
+      now: () => now,
+    });
+    await service.initialize(false);
+    await store.set(sessionA, connection(config, "careplan-pagination", {
+      scope: "patient/CarePlan.s",
+      fhirCapabilities: [{
+        resourceType: "CarePlan",
+        interactions: ["search"],
+        searchParameters: ["patient", "category"],
+      }],
+    }));
+
+    try {
+      const context = (await service.getConnectionSummary(sessionA)).connectionContext;
+      const first = await service.searchBound(
+        sessionA,
+        "CarePlan",
+        new URLSearchParams({ category }),
+        context,
+      );
+      const localNext = (first.value as { link: Array<{ url: string }> }).link[0]!.url;
+      const cursorToken = new URL(localNext, "https://app.example.test").searchParams.get("cursor")!;
+
+      expect(decodePageCursor(cursorToken, sessionA, config.sessionSecret, now)).toMatchObject({
+        resourceType: "CarePlan",
+        constraints: [{ name: "category", value: category }],
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
   it("seals and preserves automatic Provenance inclusion in paging cursors", async () => {
     const config = makeConfig({
       EPIC_ALLOWED_RESOURCE_TYPES: "CareTeam,Provenance",

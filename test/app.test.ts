@@ -354,6 +354,116 @@ describe("HTTP application", () => {
     expect(Object.keys(invalidPage.headers)).not.toContain("x-moonba-fhir-source");
   });
 
+  it("correlates an opt-in Epic error wire log with the browser request ID", async () => {
+    const resourceScopes = "patient/Practitioner.s";
+    const config = makeConfig({
+      EPIC_ALLOWED_RESOURCE_TYPES: "Practitioner",
+      EPIC_ALLOWED_RESOURCE_SCOPES: resourceScopes,
+      EPIC_FHIR_WIRE_LOGGING: "errors",
+    });
+    const now = Date.now();
+    const sessionId = "w".repeat(43);
+    const store = new InMemoryConnectionStore();
+    await store.initialize();
+    await store.set(sessionId, {
+      oauthClientId: config.clientId,
+      tokenAuthMethod: config.tokenAuthMethod,
+      fhirBaseUrl: config.fhirBaseUrl,
+      tokenEndpoint: "https://ehr.example.test/token",
+      accessToken: "wire-log-access-token",
+      tokenType: "Bearer",
+      expiresAt: now + 60 * 60 * 1_000,
+      scope: resourceScopes,
+      patientId: "patient-wire-log",
+      oidcIssuer: "https://ehr.example.test/oauth2",
+      oidcSubject: "account-wire-log",
+      consent: {
+        policyVersion: config.consentPolicyVersion,
+        acceptedAt: now - 1_000,
+        purpose: "patient-access",
+        requestedScopes: [...config.scopes],
+        allowedResourceScopes: [...config.allowedResourceScopes],
+      },
+      fhirCapabilities: [{
+        resourceType: "Practitioner",
+        interactions: ["search"],
+        searchParameters: ["_count"],
+      }],
+      connectedAt: now - 1_000,
+      lastAccessAt: now - 1_000,
+      sessionExpiresAt: now + 60 * 60 * 1_000,
+    });
+    const operationOutcomeBody = JSON.stringify({
+      resourceType: "OperationOutcome",
+      issue: [{
+        severity: "error",
+        code: "invalid",
+        diagnostics: "Practitioner search requires a criterion.",
+      }],
+    });
+    const fetchMock = vi.fn(async () => new Response(operationOutcomeBody, {
+      status: 400,
+      headers: { "content-type": "application/fhir+json" },
+    }));
+    const wireLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, "info").mockImplementation((line) => {
+      if (typeof line === "string" && line.includes('"fhirWire"')) {
+        wireLines.push(line);
+      }
+    });
+    const app = await buildApp(config, {
+      store,
+      fetch: fetchMock as FetchLike,
+      enablePruneTimer: false,
+      audit: () => undefined,
+    });
+    openApps.push(app);
+
+    try {
+      const cookie = `${config.cookieName}=${app.signCookie(sessionId)}`;
+      const connection = await app.inject({
+        method: "GET",
+        url: "/api/connection",
+        headers: { cookie },
+      });
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/fhir/Practitioner?_count=20",
+        headers: {
+          cookie,
+          "x-epic-expected-connection-context": connection.json().connectionContext,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: {
+          code: "fhir_request_rejected",
+          message: "Epic rejected the Practitioner search parameters.",
+        },
+      });
+      expect(response.body).not.toContain("Practitioner search requires a criterion");
+      expect(wireLines).toHaveLength(2);
+      const request = JSON.parse(wireLines[0]!).fhirWire as Record<string, unknown>;
+      const upstream = JSON.parse(wireLines[1]!).fhirWire as Record<string, unknown>;
+      expect(request).toMatchObject({
+        direction: "request",
+        requestId: response.headers["x-request-id"],
+        url: `${config.fhirBaseUrl}/Practitioner?_count=20`,
+      });
+      expect(upstream).toMatchObject({
+        direction: "response",
+        requestId: response.headers["x-request-id"],
+        exchangeId: request.exchangeId,
+        status: 400,
+        body: operationOutcomeBody,
+      });
+      expect(wireLines.join("\n")).not.toContain("wire-log-access-token");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
   it("rejects missing, forged, and stale consent before creating a session or contacting Epic", async () => {
     const config = makeConfig({ CONSENT_POLICY_VERSION: "terms-v2" });
     const fetchMock = vi.fn();

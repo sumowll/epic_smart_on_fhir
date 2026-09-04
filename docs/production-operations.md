@@ -142,18 +142,20 @@ scope, Incoming API, endpoint, JWKS, persistent-access, or ownership changes.
 
 ### Configuration source of truth
 
-`wrangler.jsonc` currently has `keep_vars: false`. Wrangler therefore replaces
-ordinary dashboard variables with the variables in the deployment source of
-truth. A one-time dashboard setup is not durable across releases.
+`wrangler.jsonc` currently has `keep_vars: true`. Wrangler therefore preserves
+dashboard-managed ordinary variables that are omitted from the deployment
+configuration. Those values survive releases, but they can drift independently
+of the repository and must be reconciled against an approved inventory.
 
 **Operator gate:** choose one audited production mechanism and test it before
 go-live:
 
-1. put non-secret production variables in a protected environment-specific
-   Wrangler configuration, or
+1. keep non-secret production variables in a protected environment-specific
+   Wrangler configuration and set `keep_vars` according to that source of truth,
+   or
 2. inject a reviewed generated configuration in CI, or
-3. deliberately deploy with `--keep-vars --strict` after verifying remote
-   configuration drift.
+3. retain dashboard-managed variables with `--keep-vars --strict` only after
+   comparing the remote configuration with the approved inventory.
 
 Do not commit real secrets or an environment file containing them. Secrets are
 preserved separately by Wrangler, but changing a secret can create a new Worker
@@ -186,6 +188,7 @@ Store these as ordinary variables in the controlled production source of truth:
 | `EPIC_REQUEST_OFFLINE_ACCESS` | Enable only with an approved persistent-access use case. |
 | `EPIC_ALLOWED_RESOURCE_TYPES` | Minimum product allowlist; it is not a substitute for Epic scope configuration. |
 | `EPIC_TRUSTED_ENDPOINT_ORIGINS` | Explicit HTTPS origins for every approved Epic discovery/token/FHIR endpoint. |
+| `EPIC_FHIR_WIRE_LOGGING` | Keep `off` in production. `errors` and `all` emit PHI-bearing diagnostic records and require a separately approved, temporary diagnostic procedure. |
 | `SESSION_IDLE_TIMEOUT_SECONDS` | Approved idle timeout, 300–86,400 seconds. |
 | `SESSION_MAX_LIFETIME_SECONDS` | Approved absolute lifetime, 900–86,400 seconds and not shorter than idle timeout. |
 | `TOKEN_ENCRYPTION_KEY_ID` | Non-secret, unique identifier for the current data key, such as `prod-2026-09-01`. |
@@ -299,8 +302,8 @@ Before upload:
 3. if the hub intelligence purpose changed, confirm the approved notice and
    deployed `FHIR_HUB_CONSENT_VERSION` identify the same immutable version and
    that backfill capacity/monitoring has been reviewed;
-4. confirm ordinary variables will survive the deployment despite
-   `keep_vars: false`;
+4. reconcile preserved dashboard variables with the approved inventory and
+   explicitly confirm `EPIC_FHIR_WIRE_LOGGING=off`;
 5. validate required bindings and secrets without printing their values;
 6. capture the previous stable Worker version and the current storage schema
    version; and
@@ -598,6 +601,16 @@ query strings, cookies, OAuth codes/state, FHIR IDs, response bodies, and tokens
 Session references are truncated HMAC values. Audit transport failures are
 swallowed so logging cannot leak an error or break a patient request.
 
+A separate FHIR wire diagnostic exists for short-lived troubleshooting and is
+`off` by default. It is not part of the privacy-reduced audit stream. When set to
+`errors` or `all`, its records are explicitly classified as sensitive and contain
+the exact FHIR URL plus direct response text (bounded to 32 KiB per response log).
+Request headers are structurally excluded; response metadata is limited to the
+numeric status, bounded status text, and bounded `Content-Type` value.
+Consequently, enabling it changes the logging data boundary and is not an ordinary
+production configuration change. The response body is deliberately not redacted
+and can contain PHI or credential-like values returned by the upstream server.
+
 This is a safe event schema, not a complete audit service. Best-effort console
 delivery can be missing, duplicated, delayed, or inaccessible during an outage.
 
@@ -608,9 +621,13 @@ delivery can be missing, duplicated, delayed, or inaccessible during an outage.
 - audit Cloudflare zone, WAF, DNS, browser analytics, support, APM, Logpush,
   SIEM, and downstream destinations separately—`invocation_logs: false` does not
   disable every possible log source;
-- prohibit raw request/response logging and generic serialization of exceptions,
-  headers, URLs, cookies, tokens, FHIR resources, OAuth callback queries, patient
-  names, or identifiers;
+- keep `EPIC_FHIR_WIRE_LOGGING=off`; any temporary exception requires documented
+  privacy/security approval, an approved synthetic or minimum-necessary test
+  identity, isolated destinations and readers, explicit retention/deletion, and
+  immediate disablement after one bounded capture;
+- otherwise prohibit raw request/response logging and generic serialization of
+  exceptions, headers, URLs, cookies, tokens, FHIR resources, OAuth callback
+  queries, patient names, or identifiers;
 - restrict log readers and exporters, encrypt destinations, choose approved
   regions, document retention/deletion, monitor delivery lag/failure, and make
   administrative access auditable;

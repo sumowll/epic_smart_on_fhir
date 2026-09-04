@@ -1,4 +1,5 @@
 import type { AppConfig } from "./types.js";
+import { EPIC_CARE_PLAN_SEARCH_TYPES } from "./care-plan.js";
 
 function escapeHtml(value: string): string {
   return value
@@ -129,6 +130,15 @@ function renderResourceOptions(allowedResourceTypes: ReadonlySet<string>): {
   };
 }
 
+function renderCarePlanSearchTypeOptions(): string {
+  return [
+    '<option value="">Choose a care plan type</option>',
+    ...EPIC_CARE_PLAN_SEARCH_TYPES.map(({ category, label, description }) =>
+      `<option value="${escapeHtml(category)}">${escapeHtml(label)} — ${escapeHtml(description)}</option>`
+    ),
+  ].join("");
+}
+
 export function renderHome(config: AppConfig): string {
   const resourceSelector = renderResourceOptions(config.allowedResourceTypes);
   const idleTimeout = escapeHtml(formatDuration(config.sessionIdleTimeoutMs));
@@ -183,6 +193,11 @@ export function renderHome(config: AppConfig): string {
           <div id="search-constraints" class="search-constraints" hidden>
             <div id="search-constraint-fields" class="search-constraint-fields"></div>
             <p id="search-constraint-hint" class="hint"></p>
+          </div>
+          <div id="careplan-type-control" class="careplan-type-control" hidden>
+            <label for="careplan-type">Care plan type</label>
+            <select id="careplan-type" aria-describedby="careplan-type-hint" disabled>${renderCarePlanSearchTypeOptions()}</select>
+            <p id="careplan-type-hint" class="hint">Epic requires exactly one category for every CarePlan search. Availability also depends on the matching CarePlan Incoming API at the connected organization.</p>
           </div>
           <div id="resource-id-control" class="resource-id-control" hidden>
             <label for="resource-id">FHIR resource ID</label>
@@ -534,6 +549,9 @@ button:hover, .button:hover { background: #065e57; }
 .search-row { display: grid; grid-template-columns: auto minmax(180px,1fr) auto 90px auto; align-items: center; gap: 10px; }
 .resource-id-control { display: grid; grid-column: 3 / 5; grid-template-columns: auto minmax(140px, 1fr); align-items: center; gap: 8px 10px; }
 .resource-id-control .hint { grid-column: 1 / -1; margin: 0; }
+.careplan-type-control { grid-column: 1 / -1; padding: 12px 14px; border-radius: 10px; background: #edf4f5; }
+.careplan-type-control label { display: block; margin-bottom: 6px; }
+.careplan-type-control .hint { margin: 8px 0 0; }
 .search-constraints { grid-column: 1 / -1; padding: 12px 14px; border-radius: 10px; background: #edf4f5; }
 .search-constraint-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
 .constraint-field label { display: block; margin-bottom: 6px; }
@@ -687,6 +705,8 @@ const searchButton = document.querySelector('#search');
 const resourceType = document.querySelector('#resource-type');
 const resourceIdControl = document.querySelector('#resource-id-control');
 const resourceIdInput = document.querySelector('#resource-id');
+const carePlanTypeControl = document.querySelector('#careplan-type-control');
+const carePlanTypeSelect = document.querySelector('#careplan-type');
 const searchConstraints = document.querySelector('#search-constraints');
 const searchConstraintFields = document.querySelector('#search-constraint-fields');
 const searchConstraintHint = document.querySelector('#search-constraint-hint');
@@ -1036,7 +1056,9 @@ function updateSearchConstraints(preserveSelections = false) {
   const capability = searchableCapabilities.get(resourceType.value);
   if (!capability || capability.searchConstraints.length === 0) return;
 
-  capability.searchConstraints.forEach((constraint, index) => {
+  capability.searchConstraints
+    .filter((constraint) => resourceType.value !== 'CarePlan' || constraint.name !== 'category')
+    .forEach((constraint, index) => {
     const field = document.createElement('div');
     field.className = 'constraint-field';
     const label = document.createElement('label');
@@ -1061,9 +1083,41 @@ function updateSearchConstraints(preserveSelections = false) {
     searchConstraintFields.append(field);
     activeConstraintControls.push({ name: constraint.name, select });
   });
+  if (activeConstraintControls.length === 0) return;
   searchConstraintHint.textContent = 'Your MyChart authorization requires the selected filter' +
     (activeConstraintControls.length === 1 ? '' : 's') + ' for this search.';
   searchConstraints.hidden = false;
+}
+
+function updateCarePlanTypeControl(preserveSelection = false) {
+  const capability = searchableCapabilities.get(resourceType.value);
+  const selected = resourceType.value === 'CarePlan' && Boolean(capability);
+  carePlanTypeControl.hidden = !selected;
+  carePlanTypeSelect.required = selected;
+
+  if (!selected) {
+    carePlanTypeSelect.disabled = true;
+    if (!preserveSelection) carePlanTypeSelect.value = '';
+    return;
+  }
+
+  const categoryConstraint = capability.searchConstraints.find(
+    (constraint) => constraint.name === 'category',
+  );
+  const authorizedCategories = categoryConstraint
+    ? new Set(categoryConstraint.values)
+    : null;
+  for (const option of Array.from(carePlanTypeSelect.options || [])) {
+    const available = !option.value || !authorizedCategories || authorizedCategories.has(option.value);
+    option.hidden = !available;
+    option.disabled = !available;
+  }
+  const currentOption = Array.from(carePlanTypeSelect.options || []).find(
+    (option) => option.value === carePlanTypeSelect.value,
+  );
+  if (!preserveSelection || !currentOption || currentOption.disabled) {
+    carePlanTypeSelect.value = '';
+  }
 }
 
 function isDirectReadOption(option) {
@@ -1092,6 +1146,7 @@ function updateResourceActionControls(preserveSelections = false) {
   } else {
     updateSearchConstraints(preserveSelections);
   }
+  updateCarePlanTypeControl(preserveSelections);
 }
 
 function clearEffectiveCapabilities() {
@@ -1100,6 +1155,10 @@ function clearEffectiveCapabilities() {
   searchableCapabilities = new Map();
   directReadableCapabilities = new Map();
   clearConstraintControls();
+  carePlanTypeControl.hidden = true;
+  carePlanTypeSelect.value = '';
+  carePlanTypeSelect.required = false;
+  carePlanTypeSelect.disabled = true;
   resourceIdControl.hidden = true;
   resourceIdInput.value = '';
   resourceIdInput.required = false;
@@ -1169,6 +1228,7 @@ function setDataControlsDisabled(disabled) {
   resourceType.disabled = disabled || noResourceOptions;
   resourceIdInput.disabled = disabled || !directReadSelected;
   countInput.disabled = disabled || !searchSelected;
+  carePlanTypeSelect.disabled = disabled || resourceType.value !== 'CarePlan' || !searchSelected;
   searchButton.disabled = disabled || (!searchSelected && !directReadSelected);
   for (const control of activeConstraintControls) {
     control.select.disabled = disabled;
@@ -3411,6 +3471,13 @@ searchForm.addEventListener('submit', async (event) => {
   if (!capability) return;
   const parameters = new URLSearchParams();
   parameters.set('_count', countInput.value);
+  if (resourceType.value === 'CarePlan') {
+    if (!carePlanTypeSelect.value) {
+      showApiError(new Error('Choose a care plan type.'));
+      return;
+    }
+    parameters.set('category', carePlanTypeSelect.value);
+  }
   for (const constraint of activeConstraintControls) {
     if (!constraint.select.value) {
       showApiError(new Error('Choose an authorized ' + friendlyConstraintName(constraint.name).toLowerCase() + '.'));

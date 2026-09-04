@@ -194,11 +194,11 @@ and rollback gates are in the
 [production operations runbook](docs/production-operations.md).
 
 Runtime values are not Workers Builds variables. The current Wrangler file has
-`keep_vars: false`, so a deployment replaces ordinary variables that exist only in
-the dashboard. A production pipeline must either provide a protected
-environment-specific Wrangler configuration or deliberately deploy with
-`--keep-vars --strict` after checking remote drift. Do not rely on a one-time dashboard
-setup surviving the next release.
+`keep_vars: true`, so a deployment preserves dashboard-managed ordinary variables
+that are omitted from the file. A production pipeline must keep an approved
+inventory, compare it with the target Worker before each release, and deploy with
+`--keep-vars --strict`; the repository alone cannot reconstruct or detect drift in
+those preserved values.
 
 Configure these non-secret runtime variables for the target environment:
 
@@ -218,6 +218,7 @@ EPIC_ALLOWED_RESOURCE_SCOPES=copy-the-exact-53-value-line-from-.dev.vars.example
 EPIC_REQUEST_OFFLINE_ACCESS=false
 EPIC_ALLOWED_RESOURCE_TYPES=AllergyIntolerance,Binary,CarePlan,CareTeam,Condition,Device,DiagnosticReport,DocumentReference,Encounter,Goal,Immunization,Location,Medication,MedicationRequest,Observation,Organization,Practitioner,PractitionerRole,Procedure,Provenance,RelatedPerson
 EPIC_TRUSTED_ENDPOINT_ORIGINS=https://fhir.epic.com
+EPIC_FHIR_WIRE_LOGGING=off
 SESSION_IDLE_TIMEOUT_SECONDS=1800
 SESSION_MAX_LIFETIME_SECONDS=28800
 TOKEN_ENCRYPTION_KEY_ID=2026-rotation-1
@@ -581,6 +582,49 @@ URLs, cookies, or tokens. For operator-only source comparison, the `fhir:get`
 utility above must use the same provider, grant, resource, and effective filters.
 Keep its access token only in the current process environment and never in `.env`,
 arguments, logs, or support evidence.
+
+### Temporary backend FHIR wire diagnostics
+
+The backend can emit the exact outbound FHIR `GET` URL and the direct decoded
+Epic response body before JSON parsing, validation, or public error sanitization.
+This is deliberately disabled by default. For the smallest useful diagnostic,
+start an isolated local or non-production instance with:
+
+```bash
+EPIC_FHIR_WIRE_LOGGING=errors pnpm run dev
+```
+
+Then reproduce the failure once and find the single-line JSON records whose
+`fhirWire.requestId` matches the request reference displayed by the browser. An
+Epic HTTP response produces a request/response pair with a shared `exchangeId`,
+which distinguishes multiple Epic calls made during one browser request. A
+transport, redirect, or response-size failure may produce only the request record
+because no complete response body was available.
+
+`errors` logs non-200 Epic responses plus transport and JSON-parsing failures. A
+200 response that the connector later rejects during resource, Bundle, or SMART
+authorization validation is an upstream HTTP success; diagnosing that uncommon
+case temporarily requires `all`. `all` also logs every successful FHIR body and
+should almost never be needed. `off` is the default and production setting.
+
+The wire logger cannot accept request headers, so it never records the bearer
+`Authorization` value. It records response text up to 32 KiB and reports the full
+byte count, logged byte count, and `bodyTruncated` flag. An Epic
+`OperationOutcome` is normally much smaller and is therefore preserved verbatim.
+Response metadata is limited to the numeric status, bounded status text, and
+bounded `Content-Type` value.
+The public API response remains sanitized even while the backend diagnostic is
+enabled. The direct response body is intentionally not redacted and must be
+treated as potentially containing both PHI and credential-like values supplied by
+the upstream server.
+
+**The exact URL, search values, and response body can contain PHI.** Custom Worker
+console logs can be retained and exported even though automatic invocation logs
+are disabled. Use an approved synthetic identity and isolated log destination,
+restrict readers and retention, never paste these records into a support ticket,
+and restore `EPIC_FHIR_WIRE_LOGGING=off` immediately after capture. Enabling this
+against production patient data requires explicit privacy/security approval for
+the logging destination, access, region, retention, and deletion controls.
 
 ## Troubleshooting Epic 403 responses
 

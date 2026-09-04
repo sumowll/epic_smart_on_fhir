@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { EPIC_CARE_PLAN_SEARCH_TYPES } from "../src/care-plan.js";
 import { EpicFhirClient, EpicRateLimitError, sanitizeSearchParameters } from "../src/fhir.js";
 import {
   assertGrantedSmartScopesWithinPolicy,
@@ -74,7 +75,9 @@ function withProvenanceReverseInclude(
     fhirCapabilities: [{
       resourceType,
       interactions: ["search"],
-      searchParameters: ["patient"],
+      searchParameters: resourceType === "CarePlan"
+        ? ["patient", "category"]
+        : ["patient"],
       searchRevIncludes: [provenanceReverseInclude],
     }, {
       resourceType: "Provenance",
@@ -258,6 +261,36 @@ describe("FHIR continuation pages", () => {
       nextUrl.toString(),
     )).rejects.toMatchObject({ code: "fhir_scope_constraint_conflict" });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves the selected CarePlan type across continuation pages", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      expect(new URL(input.toString()).searchParams.get("category")).toBe("38717003");
+      return jsonResponse(emptySearchBundle());
+    });
+    const client = new EpicFhirClient(makeConfig({
+      EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+    }), fetchMock as FetchLike);
+    const nextUrl = new URL(`${record.fhirBaseUrl}/CarePlan`);
+    nextUrl.searchParams.set("_getpages", "opaque");
+    nextUrl.searchParams.set("category", "734163000");
+
+    await expect(client.page(
+      withScope("patient/CarePlan.s"),
+      "CarePlan",
+      nextUrl.toString(),
+      [{ name: "category", value: "38717003" }],
+    )).rejects.toMatchObject({ code: "invalid_page_cursor" });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    nextUrl.searchParams.set("category", "38717003");
+    await expect(client.page(
+      withScope("patient/CarePlan.s"),
+      "CarePlan",
+      nextUrl.toString(),
+      [{ name: "category", value: "38717003" }],
+    )).resolves.toEqual(emptySearchBundle());
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("rejects a continuation URL that explicitly changes the patient compartment", async () => {
@@ -453,6 +486,64 @@ describe("FHIR client", () => {
     });
   });
 
+  it.each(EPIC_CARE_PLAN_SEARCH_TYPES)(
+    "searches $label CarePlans with Epic's required category",
+    async ({ category }) => {
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(input.toString());
+        expect(url.origin + url.pathname).toBe(
+          "https://ehr.example.test/api/FHIR/R4/CarePlan",
+        );
+        expect(url.searchParams.get("patient")).toBe("patient-1");
+        expect(url.searchParams.getAll("category")).toEqual([category]);
+        expect(url.searchParams.get("_count")).toBe("20");
+        return jsonResponse(emptySearchBundle());
+      });
+      const client = new EpicFhirClient(makeConfig({
+        EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+      }), fetchMock as FetchLike);
+
+      const result = await client.searchWithContext(
+        withScope("patient/CarePlan.s"),
+        "CarePlan",
+        new URLSearchParams({ category, _count: "20" }),
+      );
+      expect(result.bundle).toMatchObject({ resourceType: "Bundle", type: "searchset" });
+      expect(result.constraints).toEqual([{ name: "category", value: category }]);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("rejects missing, unknown, or repeated CarePlan categories before contacting Epic", async () => {
+    const fetchMock = vi.fn();
+    const client = new EpicFhirClient(makeConfig({
+      EPIC_ALLOWED_RESOURCE_TYPES: "CarePlan",
+    }), fetchMock as FetchLike);
+    const carePlanRecord = withScope("patient/CarePlan.s");
+
+    await expect(client.search(
+      carePlanRecord,
+      "CarePlan",
+      new URLSearchParams("_count=20"),
+    )).rejects.toMatchObject({ code: "careplan_category_required" });
+    await expect(client.search(
+      withScope("patient/CarePlan.s?category=38717003"),
+      "CarePlan",
+      new URLSearchParams("_count=20"),
+    )).rejects.toMatchObject({ code: "careplan_category_required" });
+    await expect(client.search(
+      carePlanRecord,
+      "CarePlan",
+      new URLSearchParams("_count=20&category=unknown"),
+    )).rejects.toMatchObject({ code: "careplan_category_invalid" });
+    await expect(client.search(
+      carePlanRecord,
+      "CarePlan",
+      new URLSearchParams("_count=20&category=38717003&category=734163000"),
+    )).rejects.toMatchObject({ code: "careplan_category_invalid" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it.each(searchableResourceTypes)(
     "automatically includes available Provenance for %s search",
     async (resourceType) => {
@@ -478,11 +569,15 @@ describe("FHIR client", () => {
       const client = new EpicFhirClient(makeConfig({
         EPIC_ALLOWED_RESOURCE_TYPES: `${resourceType},Provenance`,
       }), fetchMock as FetchLike);
+      const search = new URLSearchParams("_count=20");
+      if (resourceType === "CarePlan") {
+        search.set("category", EPIC_CARE_PLAN_SEARCH_TYPES[0].category);
+      }
 
       await expect(client.search(
         withProvenanceReverseInclude(resourceType),
         resourceType,
-        new URLSearchParams("_count=20"),
+        search,
       )).resolves.toEqual(bundle);
     },
   );
@@ -1706,6 +1801,78 @@ describe("FHIR client", () => {
       expect(error).toMatchObject({ statusCode: status, code: "fhir_request_rejected" });
       expect((error as Error).message).not.toContain("sensitive upstream diagnostics");
     }
+  });
+
+  it("wire-logs the exact rejected Practitioner exchange with the browser request ID", async () => {
+    const operationOutcomeBody = JSON.stringify({
+      resourceType: "OperationOutcome",
+      issue: [{
+        severity: "error",
+        code: "invalid",
+        diagnostics: "At least one Practitioner search criterion is required.",
+      }],
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(input.toString()).toBe(
+        "https://ehr.example.test/api/FHIR/R4/Practitioner?_count=20",
+      );
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer access-token");
+      return new Response(operationOutcomeBody, {
+        status: 400,
+        headers: { "content-type": "application/fhir+json" },
+      });
+    });
+    const lines: string[] = [];
+    const client = new EpicFhirClient(
+      makeConfig({
+        EPIC_ALLOWED_RESOURCE_TYPES: "Practitioner",
+        EPIC_FHIR_WIRE_LOGGING: "errors",
+      }),
+      fetchMock as FetchLike,
+      (line) => lines.push(line),
+    );
+
+    try {
+      await client.search(
+        withScope("patient/Practitioner.s"),
+        "Practitioner",
+        new URLSearchParams({ _count: "20" }),
+        "8ff8d2c7-ec18-4bd9-b2cd-b2b2037acba4",
+      );
+      expect.unreachable("Expected Epic to reject the Practitioner search");
+    } catch (error) {
+      expect(error).toMatchObject({
+        statusCode: 400,
+        code: "fhir_request_rejected",
+      });
+      expect((error as Error).message).not.toContain(
+        "At least one Practitioner search criterion",
+      );
+    }
+
+    expect(lines).toHaveLength(2);
+    const request = JSON.parse(lines[0]!).fhirWire as Record<string, unknown>;
+    const response = JSON.parse(lines[1]!).fhirWire as Record<string, unknown>;
+    expect(request).toMatchObject({
+      direction: "request",
+      requestId: "8ff8d2c7-ec18-4bd9-b2cd-b2b2037acba4",
+      resourceType: "Practitioner",
+      interaction: "search",
+      url: "https://ehr.example.test/api/FHIR/R4/Practitioner?_count=20",
+      outcome: "error",
+    });
+    expect(response).toMatchObject({
+      direction: "response",
+      requestId: request.requestId,
+      exchangeId: request.exchangeId,
+      status: 400,
+      contentType: "application/fhir+json",
+      body: operationOutcomeBody,
+      bodyTruncated: false,
+      errorCode: "fhir_request_rejected",
+    });
+    expect(lines.join("\n")).not.toContain("access-token");
+    expect(lines.join("\n")).not.toContain("Authorization");
   });
 
   it("retains safe Retry-After metadata for Epic rate limits", async () => {

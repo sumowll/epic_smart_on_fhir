@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 
+import { isEpicCarePlanSearchCategory } from "./care-plan.js";
 import { AppError, ReconnectRequiredError } from "./errors.js";
 import { EpicDiscoveryService } from "./discovery.js";
 import {
@@ -427,6 +428,11 @@ export class EpicConnectorService {
       const read = readConstraintAlternatives.length > 0;
       const searchableGrants = resourceGrants.filter((grant) =>
         grant.permissions.has("search") &&
+        (
+          resourceType !== "CarePlan" ||
+          grant.constraints.every(({ name, value }) =>
+            name !== "category" || isEpicCarePlanSearchCategory(value))
+        ) &&
         serverSupportsSmartSearch(
           resourceType,
           server?.searchParameters ?? [],
@@ -505,11 +511,14 @@ export class EpicConnectorService {
     };
   }
 
-  public async readPatient(sessionId: string): Promise<unknown> {
+  public async readPatient(
+    sessionId: string,
+    requestId?: string,
+  ): Promise<unknown> {
     return (await this.withBoundFhirConnection(
       sessionId,
       async (record) => {
-        const value = await this.#fhir.readPatient(record);
+        const value = await this.#fhir.readPatient(record, requestId);
         await this.ingestFhirResponse(record, value);
         return value;
       },
@@ -519,11 +528,12 @@ export class EpicConnectorService {
   public async readPatientBound(
     sessionId: string,
     expectedConnectionContext: string | undefined,
+    requestId?: string,
   ): Promise<ConnectionBoundResult<unknown>> {
     return this.withBoundFhirConnection(
       sessionId,
       async (record) => {
-        const value = await this.#fhir.readPatient(record);
+        const value = await this.#fhir.readPatient(record, requestId);
         await this.ingestFhirResponse(record, value);
         return value;
       },
@@ -536,9 +546,10 @@ export class EpicConnectorService {
     sessionId: string,
     resourceType: string,
     id: string,
+    requestId?: string,
   ): Promise<unknown> {
     return (await this.withBoundFhirConnection(sessionId, async (record) => {
-      const value = await this.#fhir.read(record, resourceType, id);
+      const value = await this.#fhir.read(record, resourceType, id, requestId);
       await this.ingestFhirResponse(record, value);
       return value;
     })).value;
@@ -549,11 +560,12 @@ export class EpicConnectorService {
     resourceType: string,
     id: string,
     expectedConnectionContext: string | undefined,
+    requestId?: string,
   ): Promise<ConnectionBoundResult<unknown>> {
     return this.withBoundFhirConnection(
       sessionId,
       async (record) => {
-        const value = await this.#fhir.read(record, resourceType, id);
+        const value = await this.#fhir.read(record, resourceType, id, requestId);
         await this.ingestFhirResponse(record, value);
         return value;
       },
@@ -566,11 +578,15 @@ export class EpicConnectorService {
     sessionId: string,
     resourceType: string,
     search: URLSearchParams,
+    requestId?: string,
   ): Promise<unknown> {
     return (await this.searchWithBoundContext(
       sessionId,
       resourceType,
       search,
+      undefined,
+      false,
+      requestId,
     )).value;
   }
 
@@ -579,6 +595,7 @@ export class EpicConnectorService {
     resourceType: string,
     search: URLSearchParams,
     expectedConnectionContext: string | undefined,
+    requestId?: string,
   ): Promise<ConnectionBoundResult<unknown>> {
     return this.searchWithBoundContext(
       sessionId,
@@ -586,6 +603,7 @@ export class EpicConnectorService {
       search,
       expectedConnectionContext,
       true,
+      requestId,
     );
   }
 
@@ -595,9 +613,15 @@ export class EpicConnectorService {
     search: URLSearchParams,
     expectedConnectionContext?: string,
     requireExpectedConnectionContext = false,
+    requestId?: string,
   ): Promise<ConnectionBoundResult<unknown>> {
     return this.withBoundFhirConnection(sessionId, async (record) => {
-      const result = await this.#fhir.searchWithContext(record, resourceType, search);
+      const result = await this.#fhir.searchWithContext(
+        record,
+        resourceType,
+        search,
+        requestId,
+      );
       await this.ingestFhirResponse(record, result.bundle);
       return this.decorateSearchBundle(
         sessionId,
@@ -610,20 +634,32 @@ export class EpicConnectorService {
     }, expectedConnectionContext, requireExpectedConnectionContext);
   }
 
-  public async page(sessionId: string, cursorToken: string): Promise<unknown> {
-    return (await this.pageWithBoundContext(sessionId, cursorToken)).value;
+  public async page(
+    sessionId: string,
+    cursorToken: string,
+    requestId?: string,
+  ): Promise<unknown> {
+    return (await this.pageWithBoundContext(
+      sessionId,
+      cursorToken,
+      undefined,
+      false,
+      requestId,
+    )).value;
   }
 
   public async pageBound(
     sessionId: string,
     cursorToken: string,
     expectedConnectionContext: string | undefined,
+    requestId?: string,
   ): Promise<PageBoundResult<unknown>> {
     return this.pageWithBoundContext(
       sessionId,
       cursorToken,
       expectedConnectionContext,
       true,
+      requestId,
     );
   }
 
@@ -632,6 +668,7 @@ export class EpicConnectorService {
     cursorToken: string,
     expectedConnectionContext?: string,
     requireExpectedConnectionContext = false,
+    requestId?: string,
   ): Promise<PageBoundResult<unknown>> {
     const cursor = decodePageCursor(
       cursorToken,
@@ -647,6 +684,7 @@ export class EpicConnectorService {
         cursor.nextUrl,
         constraints,
         cursor.includeProvenance === true,
+        requestId ? { requestId } : undefined,
       );
       await this.ingestFhirResponse(record, result);
       return this.decorateSearchBundle(
