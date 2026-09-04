@@ -397,7 +397,11 @@ describe("legal pages", () => {
     expect(html).toContain('<option value="734163000">Encounter-level — visit assessment and plan</option>');
     expect(html).toContain('<option value="736271009">Outpatient — ambulatory care plan</option>');
     expect(html).toContain('<option value="738906000">Dental — dental treatment plan</option>');
-    expect(html).toContain('<option value="assess-plan">Outside record — imported assessment and plan</option>');
+    expect(html).toContain(
+      '<option value="assess-plan">Assessment and plan — content category; source shown per record</option>',
+    );
+    expect(html).not.toContain("Outside record — imported assessment and plan");
+    expect(html).toContain("Assessment and plan is a content category, not an external-source filter.");
     expect(html).toContain('Response trace: where information can go missing');
     expect(html).toContain('id="field-check-form"');
     expect(html).toContain('Advanced: complete application FHIR JSON');
@@ -1298,6 +1302,102 @@ describe("legal pages", () => {
       "HTTP 403 · error fhir_scope_denied · request request-detail-403",
     );
     expect(harness.elements["#result"].textContent).toContain('"resourceType": "Bundle"');
+  });
+
+  it("labels only CarePlans with Epic's exact external-data tag as outside records", async () => {
+    const assessmentCategory = [{
+      coding: [{
+        system: "http://hl7.org/fhir/us/core/CodeSystem/careplan-category",
+        code: "assess-plan",
+        display: "Assessment and Plan of Treatment",
+      }],
+      text: "Assessment and Plan of Treatment",
+    }];
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/CarePlan.s"],
+          capabilities: [{
+            resourceType: "CarePlan",
+            read: false,
+            search: true,
+            searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/careplan-source-test") {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{
+            resource: {
+              resourceType: "CarePlan",
+              id: "external-plan",
+              title: "Tagged plan",
+              status: "active",
+              intent: "plan",
+              category: assessmentCategory,
+              meta: {
+                tag: [{
+                  system: "https://open.epic.com/FHIR/bulk-data-source",
+                  code: "external-bulk-data",
+                }],
+              },
+            },
+          }, {
+            resource: {
+              resourceType: "CarePlan",
+              id: "ordinary-plan",
+              title: "Untagged plan",
+              status: "active",
+              intent: "plan",
+              category: assessmentCategory,
+            },
+          }, {
+            resource: {
+              resourceType: "CarePlan",
+              id: "split-tag-plan",
+              title: "Split tag plan",
+              status: "active",
+              intent: "plan",
+              category: assessmentCategory,
+              meta: {
+                tag: [{
+                  system: "https://open.epic.com/FHIR/bulk-data-source",
+                  code: "different-code",
+                }, {
+                  system: "https://example.test/not-epic",
+                  code: "external-bulk-data",
+                }],
+              },
+            },
+          }],
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/careplan-source-test", "Care plans");
+
+    const cards = harness.elements["#temporal-graph-list"].children.map(
+      (item) => item.children[1],
+    );
+    expect(cards).toHaveLength(3);
+    expect(cardDetails(cards[0]).get("Plan category")).toBe("Assessment and Plan of Treatment");
+    expect(cardDetails(cards[0]).get("Record source")).toBe(
+      "Outside record (marked as external by Epic)",
+    );
+    expect(cardDetails(cards[1]).get("Record source")).toBe(
+      "Not marked as an outside record by Epic",
+    );
+    expect(cardDetails(cards[2]).get("Record source")).toBe(
+      "Not marked as an outside record by Epic",
+    );
   });
 
   it("shows every field returned for encounter-derived Location resources", async () => {

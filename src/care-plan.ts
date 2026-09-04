@@ -4,6 +4,12 @@ export interface EpicCarePlanSearchType {
   readonly description: string;
 }
 
+/** Epic's documented source marker for CarePlans loaded from another FHIR server. */
+export const EPIC_OUTSIDE_RECORD_TAG = {
+  system: "https://open.epic.com/FHIR/bulk-data-source",
+  code: "external-bulk-data",
+} as const;
+
 /**
  * Epic routes CarePlan searches by one required category token. Keep the
  * patient-facing labels and the server-side allowlist sourced from this single
@@ -32,8 +38,8 @@ export const EPIC_CARE_PLAN_SEARCH_TYPES = [
   },
   {
     category: "assess-plan",
-    label: "Outside record",
-    description: "imported assessment and plan",
+    label: "Assessment and plan",
+    description: "content category; source shown per record",
   },
 ] as const satisfies readonly EpicCarePlanSearchType[];
 

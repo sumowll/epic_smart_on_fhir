@@ -1,5 +1,8 @@
 import type { AppConfig } from "./types.js";
-import { EPIC_CARE_PLAN_SEARCH_TYPES } from "./care-plan.js";
+import {
+  EPIC_CARE_PLAN_SEARCH_TYPES,
+  EPIC_OUTSIDE_RECORD_TAG,
+} from "./care-plan.js";
 
 function escapeHtml(value: string): string {
   return value
@@ -197,7 +200,7 @@ export function renderHome(config: AppConfig): string {
           <div id="careplan-type-control" class="careplan-type-control" hidden>
             <label for="careplan-type">Care plan type</label>
             <select id="careplan-type" aria-describedby="careplan-type-hint" disabled>${renderCarePlanSearchTypeOptions()}</select>
-            <p id="careplan-type-hint" class="hint">Epic requires exactly one category for every CarePlan search. Availability also depends on the matching CarePlan Incoming API at the connected organization.</p>
+            <p id="careplan-type-hint" class="hint">Epic requires exactly one category for every CarePlan search. Assessment and plan is a content category, not an external-source filter. A result is identified as an outside record only when Epic supplies its external-data marker. Availability also depends on the matching CarePlan Incoming API at the connected organization.</p>
           </div>
           <div id="resource-id-control" class="resource-id-control" hidden>
             <label for="resource-id">FHIR resource ID</label>
@@ -669,6 +672,7 @@ a:hover { color: #064f4a; }
 `;
 
 export const browserScript = `
+const epicOutsideRecordTag = Object.freeze(${JSON.stringify(EPIC_OUTSIDE_RECORD_TAG)});
 const statusElement = document.querySelector('#status');
 const connectForm = document.querySelector('#connect-form');
 const connectButton = document.querySelector('#connect');
@@ -970,6 +974,16 @@ function collectResourceCodings(value) {
   if (!value || typeof value !== 'object') return [];
   if (Array.isArray(value.coding)) return value.coding.flatMap(collectResourceCodings);
   return typeof value.code === 'string' ? [value] : [];
+}
+
+function carePlanHasEpicOutsideRecordTag(resource) {
+  if (!resource || typeof resource !== 'object' || resource.resourceType !== 'CarePlan') return false;
+  const meta = resource.meta;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta) || !Array.isArray(meta.tag)) return false;
+  return meta.tag.some((tag) =>
+    tag && typeof tag === 'object' && !Array.isArray(tag) &&
+    tag.system === epicOutsideRecordTag.system && tag.code === epicOutsideRecordTag.code
+  );
 }
 
 function codingMatchesConstraintToken(coding, token) {
@@ -2148,6 +2162,16 @@ function resourceDetails(resource, options = {}) {
     case 'Goal':
       addDate('Start', resource.startDate);
       add('Achievement', resource.achievementStatus);
+      break;
+    case 'CarePlan':
+      add('Plan category', resource.category);
+      add(
+        'Record source',
+        carePlanHasEpicOutsideRecordTag(resource)
+          ? 'Outside record (marked as external by Epic)'
+          : 'Not marked as an outside record by Epic',
+      );
+      add('Intent', resource.intent && humanizeCode(resource.intent));
       break;
     case 'CareTeam': {
       add('Category', resource.category);

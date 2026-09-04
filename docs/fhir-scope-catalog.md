@@ -60,7 +60,7 @@ exact authorized constraint:
 
 | Resource | Friendly search choices | Exact catalog coverage |
 |---|---|---|
-| `CarePlan` | Longitudinal (`38717003`), Encounter-level (`734163000`), Outpatient (`736271009`), Dental (`738906000`), or Outside record (`assess-plan`) | The unrestricted `patient/CarePlan.s` grant authorizes search, but Epic still requires exactly one of these `category` values on every request. The UI makes that native API requirement explicit and the connector rejects missing, repeated, or unknown values before contacting Epic. |
+| `CarePlan` | Longitudinal (`38717003`), Encounter-level (`734163000`), Outpatient (`736271009`), Dental (`738906000`), or Assessment and plan (`assess-plan`, not source-specific) | The unrestricted `patient/CarePlan.s` grant authorizes search, but Epic still requires exactly one of these `category` values on every request. The UI makes that native API requirement explicit and the connector rejects missing, repeated, or unknown values before contacting Epic. `assess-plan` describes content, not provenance, so the UI identifies an individual result as an outside record only when Epic supplies the documented external-data source tag. |
 | `Condition` | All permitted conditions when unrestricted search is granted; otherwise an authorized category selector for Health concerns and/or Problem list | Unrestricted `.s`, health-concern `.s?category=...`, and problem-list-item `.s?category=...` are distinct grants. Read has the same three variants. |
 | `DocumentReference` | All permitted documents when unrestricted search is granted; otherwise the Clinical notes constraint | Unrestricted `.s` and clinical-note `.s?category=...` are distinct grants. Read has the same two variants. |
 | `Observation` | An authorized selector containing Laboratory results, Social history, and/or Vital signs | Only the three category-qualified search/read grants are approved; there is no unrestricted Observation scope in this catalog. |
@@ -82,7 +82,13 @@ The CarePlan tokens above follow Epic's published R4 search specifications for
 [Outside Record](https://fhir.epic.com/Specifications?api=11457). A connected
 organization must also enable the matching Incoming API; the merged
 CapabilityStatement does not identify which category-specific implementation is
-configured.
+configured. Epic uses `assess-plan` as the ordinary US Core Assessment and Plan
+content category on longitudinal and encounter-level records as well as in its
+Outside Record request example. The category therefore cannot establish source.
+An actual Epic Outside Record is identified by a `CarePlan.meta.tag` Coding with
+system `https://open.epic.com/FHIR/bulk-data-source` and code
+`external-bulk-data`; without that exact system/code pair, the connector does not
+describe the result as an outside record.
 
 ## Exact 53 FHIR resource scopes
 
