@@ -34,10 +34,10 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3",
+    "@types/node": "^26.4.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
     "vitest": "^4.0.8",
-    "wrangler": "^4.125.0"
+    "wrangler": "^4.128.0"
   }
 }
