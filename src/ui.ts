@@ -2395,6 +2395,7 @@ function sortableTimelineDate(value, valueKind = 'dateTime') {
           floating: true,
           display: readableDate(normalized),
           identity: 'calendar:' + normalized,
+          calendarDay: partial[3] ? normalized : null,
         };
   }
   if (valueKind === 'date') return null;
@@ -2424,6 +2425,7 @@ function sortableTimelineDate(value, valueKind = 'dateTime') {
     sortEndExclusive: false,
     floating: false,
     display: readableDate(normalized),
+    calendarDay: normalized.slice(0, 10),
     identity: 'instant:' + sortKey.second + ':' + sortKey.phase + ':' +
       sortKey.fraction.replace(/0+$/, ''),
   };
@@ -2442,6 +2444,7 @@ function timelineInstant(value, dateKind, valueKind = 'dateTime') {
     dateLabel: parsed.display,
     dateKind,
     momentKey: 'point|' + parsed.identity,
+    calendarDay: parsed.calendarDay,
   };
 }
 
@@ -2477,11 +2480,32 @@ function timelinePeriod(value, dateKind) {
     dateKind,
     momentKey: 'period|' + (start ? start.identity : 'open') + '|' +
       (end ? end.identity : 'open'),
+    calendarDay: start && end && start.calendarDay === end.calendarDay ? start.calendarDay : null,
   };
 }
 
 function compactTimelineMoments(candidates) {
   return candidates.flat().filter((candidate) => candidate !== null);
+}
+
+function sameTimelineDay(left, right) {
+  // Use complete source calendar dates, including periods confined to one day.
+  // Partial dates and open or multi-day periods do not establish a shared day.
+  return Boolean(left && right && left.calendarDay && left.calendarDay === right.calendarDay);
+}
+
+function mergeTimelineRecording(clinicalMoments, recorded) {
+  const moments = coalesceTimelineMoments(compactTimelineMoments(clinicalMoments));
+  if (!recorded) return moments;
+  const exactIndex = moments.findIndex((moment) => moment.momentKey === recorded.momentKey);
+  const matchingIndex = exactIndex >= 0
+    ? exactIndex
+    : moments.findIndex((moment) => sameTimelineDay(moment, recorded));
+  if (matchingIndex < 0) return [...moments, recorded];
+  // Attach the recording to one clinical event, preserving repeated occurrences.
+  return moments.map((moment, index) => index === matchingIndex
+    ? { ...moment, dateKind: moment.dateKind + ' · ' + recorded.dateKind, recordingMoment: recorded }
+    : moment);
 }
 
 function coalesceTimelineMoments(moments) {
@@ -2533,10 +2557,7 @@ function observationTimelineMoments(resource) {
     timingTimelineMoments(resource.effectiveTiming, 'Clinically relevant occurrence'),
     [timelineInstant(resource.effectiveInstant, 'Clinically relevant time', 'instant')],
   ]);
-  return compactTimelineMoments([
-    effective,
-    timelineInstant(resource.issued, 'Issued', 'instant'),
-  ]);
+  return mergeTimelineRecording(effective, timelineInstant(resource.issued, 'Issued', 'instant'));
 }
 
 function conditionBoundaryTimelineMoment(dateTime, period, dateKind) {
@@ -2563,7 +2584,8 @@ function conditionTimelineMoment(resource) {
   );
   const recorded = timelineInstant(resource.recordedDate, 'Recorded', 'dateTime');
   const withMatchingRecorded = (moment) => {
-    if (!moment || !recorded || moment.momentKey !== recorded.momentKey) return moment;
+    if (!moment || !recorded ||
+        (moment.momentKey !== recorded.momentKey && !sameTimelineDay(moment, recorded))) return moment;
     return { ...moment, dateKind: moment.dateKind + ' · Recorded' };
   };
   if (!onset && !abatement) return recorded;
@@ -2598,13 +2620,13 @@ function conditionTimelineMoment(resource) {
       start: {
         dateTime: onset.dateTime,
         dateLabel: onset.dateLabel,
-        dateKind: onset.dateKind,
+        dateKind: withMatchingRecorded(onset).dateKind,
         exact: onset.momentKey.startsWith('point|'),
       },
       end: {
         dateTime: abatement.dateTime,
         dateLabel: abatement.dateLabel,
-        dateKind: endLabel,
+        dateKind: withMatchingRecorded({ ...abatement, dateKind: endLabel }).dateKind,
         exact: abatement.momentKey.startsWith('point|'),
       },
     },
@@ -2615,11 +2637,10 @@ function timelineMomentsForResource(resource) {
   switch (resource.resourceType) {
     case 'AllergyIntolerance':
       return compactTimelineMoments([
-        firstTimelineChoice([
+        mergeTimelineRecording(firstTimelineChoice([
           [timelineInstant(resource.onsetDateTime, 'Onset', 'dateTime')],
           [timelinePeriod(resource.onsetPeriod, 'Onset period')],
-        ]),
-        timelineInstant(resource.recordedDate, 'Recorded', 'dateTime'),
+        ]), timelineInstant(resource.recordedDate, 'Recorded', 'dateTime')),
         timelineInstant(resource.lastOccurrence, 'Last occurrence', 'dateTime'),
         Array.isArray(resource.reaction)
           ? resource.reaction.map((reaction) => timelineInstant(
@@ -2631,8 +2652,9 @@ function timelineMomentsForResource(resource) {
       ]);
     case 'CarePlan':
       return compactTimelineMoments([
-        timelinePeriod(resource.period, 'Care plan period'),
-        timelineInstant(resource.created, 'Created', 'dateTime'),
+        mergeTimelineRecording([
+          timelinePeriod(resource.period, 'Care plan period'),
+        ], timelineInstant(resource.created, 'Created', 'dateTime')),
         Array.isArray(resource.activity)
           ? resource.activity.flatMap((activity) => {
               const detail = activity && activity.detail;
@@ -2657,18 +2679,14 @@ function timelineMomentsForResource(resource) {
     case 'Condition':
       return compactTimelineMoments([conditionTimelineMoment(resource)]);
     case 'DiagnosticReport':
-      return compactTimelineMoments([
-        firstTimelineChoice([
-          [timelineInstant(resource.effectiveDateTime, 'Clinically relevant time', 'dateTime')],
-          [timelinePeriod(resource.effectivePeriod, 'Clinically relevant period')],
-        ]),
-        timelineInstant(resource.issued, 'Issued', 'instant'),
-      ]);
+      return mergeTimelineRecording(firstTimelineChoice([
+        [timelineInstant(resource.effectiveDateTime, 'Clinically relevant time', 'dateTime')],
+        [timelinePeriod(resource.effectivePeriod, 'Clinically relevant period')],
+      ]), timelineInstant(resource.issued, 'Issued', 'instant'));
     case 'DocumentReference':
-      return compactTimelineMoments([
+      return mergeTimelineRecording([
         timelinePeriod(resource.context && resource.context.period, 'Document context period'),
-        timelineInstant(resource.date, 'Indexed', 'instant'),
-      ]);
+      ], timelineInstant(resource.date, 'Indexed', 'instant'));
     case 'Encounter':
       return compactTimelineMoments([
         timelinePeriod(resource.period, 'Encounter period'),
@@ -2711,8 +2729,9 @@ function timelineMomentsForResource(resource) {
       ]);
     case 'Immunization':
       return compactTimelineMoments([
-        timelineInstant(resource.occurrenceDateTime, 'Administered', 'dateTime'),
-        timelineInstant(resource.recorded, 'Recorded', 'dateTime'),
+        mergeTimelineRecording([
+          timelineInstant(resource.occurrenceDateTime, 'Administered', 'dateTime'),
+        ], timelineInstant(resource.recorded, 'Recorded', 'dateTime')),
         Array.isArray(resource.reaction)
           ? resource.reaction.map((reaction) => timelineInstant(
               reaction && reaction.date,
@@ -2744,11 +2763,10 @@ function timelineMomentsForResource(resource) {
       ]);
     case 'Provenance':
       return compactTimelineMoments([
-        firstTimelineChoice([
+        mergeTimelineRecording(firstTimelineChoice([
           [timelineInstant(resource.occurredDateTime, 'Occurred', 'dateTime')],
           [timelinePeriod(resource.occurredPeriod, 'Occurred period')],
-        ]),
-        timelineInstant(resource.recorded, 'Recorded', 'instant'),
+        ]), timelineInstant(resource.recorded, 'Recorded', 'instant')),
         Array.isArray(resource.signature)
           ? resource.signature.map((signature) => timelineInstant(
               signature && signature.when,
@@ -2920,6 +2938,7 @@ function renderTemporalEventList() {
     const card = renderResourceCard(event.resource, true, {
       timeline: true,
       dateKind: event.undated ? '' : event.dateKind,
+      recordingMoment: event.recordingMoment,
     });
     item.append(dateSlot, card);
     temporalGraphList.append(item);
@@ -3013,6 +3032,12 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
   }
 
   const details = resourceDetails(resource, options);
+  if (isTimelineCard && options.recordingMoment) {
+    const recorded = options.recordingMoment;
+    if (!details.some((detail) => detail.value === recorded.dateLabel)) {
+      details.push({ label: recorded.dateKind, value: recorded.dateLabel });
+    }
+  }
   if (resource.resourceType === 'Patient' && !isTimelineCard && details.length > 0) {
     const sections = document.createElement('div');
     sections.className = 'patient-profile-sections';

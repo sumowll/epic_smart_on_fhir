@@ -388,6 +388,34 @@ async function loadPatientProfile(patient: unknown): Promise<BrowserHarness> {
   return harness;
 }
 
+async function loadTimelineRecords(resources: readonly Record<string, unknown>[]): Promise<BrowserHarness> {
+  const resourceTypes = [...new Set(resources.map((resource) => resource.resourceType))];
+  const harness = createBrowserHarness(async (path) => {
+    if (path === "/api/connection") {
+      return jsonResponse({
+        connected: true,
+        provider: "Example Health",
+        connectionContext: connectionContextA,
+        connectedAt: "2026-08-24T20:00:00.000Z",
+        scope: resourceTypes.map((type) => `patient/${type}.s`),
+        capabilities: resourceTypes.map((resourceType) => ({
+          resourceType, read: false, readConstraintAlternatives: [],
+          search: true, searchConstraints: [],
+        })),
+      });
+    }
+    if (path === "/timeline") {
+      return jsonResponse({
+        resourceType: "Bundle", type: "searchset", entry: resources.map((resource) => ({ resource })),
+      });
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  await harness.controls.refreshStatus();
+  await harness.controls.runDataRequest("/timeline", "Health events");
+  return harness;
+}
+
 describe("legal pages", () => {
   it("renders a safe callback support reference", () => {
     const html = renderError("Authorization failed.", {
@@ -1291,21 +1319,20 @@ describe("legal pages", () => {
     expect(list.hidden).toBe(true);
     expect(list.children).toHaveLength(0);
     const timeline = harness.elements["#temporal-graph-list"];
-    expect(timeline.children).toHaveLength(2);
-    let timelineItem = timeline.children[0]!;
-    let card = timelineItem.children[1]!;
+    expect(timeline.children).toHaveLength(1);
+    const card = timeline.children[0]!.children[1]!;
     const heading = card.children.find((child) => child.tagName === "H4")!;
-    let detailButton = card.children.find((child) => child.tagName === "BUTTON")!;
+    const detailButton = card.children.find((child) => child.tagName === "BUTTON")!;
     expect(heading.textContent).toBe("Blood pressure");
     expect(card.children.some((child) => child.tagName === "DL")).toBe(true);
     expect(detailButton.textContent).toBe("View details");
     expect(detailButton.getAttribute("aria-label")).toBe("View details for Blood pressure");
     expect(harness.elements["#advanced-result"].open).toBe(false);
     expect(harness.elements["#temporal-graph"].hidden).toBe(false);
-    await harness.elements["#temporal-graph-order"].dispatch("click");
-    timelineItem = timeline.children[0]!;
-    card = timelineItem.children[1]!;
-    detailButton = card.children.find((child) => child.tagName === "BUTTON")!;
+    expect(harness.elements["#temporal-graph-order"].hidden).toBe(true);
+    expect(card.children.find((child) => child.className === "timeline-date-kind")?.textContent)
+      .toBe("Clinically relevant time · Issued");
+    expect(cardDetails(card).get("Issued")).toContain(":");
 
     await detailButton.dispatch("click");
     expect(requestedPaths).toContain("/api/fhir/Observation/observation-1");
@@ -1897,6 +1924,298 @@ describe("legal pages", () => {
       "overlapping date ranges retain source order where chronology is uncertain",
     );
     expect(harness.elements["#result-list"].hidden).toBe(true);
+  });
+
+  it("merges same-day allergy onset and recording into one card per resource", async () => {
+    const bundle = {
+      resourceType: "Bundle",
+      type: "searchset",
+      entry: ["2019-07-12T13:26:00Z", "2019-07-12T13:26:20Z"].map((recordedDate, index) => ({
+        resource: {
+          resourceType: "AllergyIntolerance",
+          id: `allergy-${index}`,
+          code: { text: "Sulfa allergy" },
+          clinicalStatus: { text: "Active" },
+          onsetDateTime: "2019-07-12",
+          recordedDate,
+          reaction: [{ manifestation: [{ text: "Rash" }] }],
+        },
+      })),
+    };
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/AllergyIntolerance.r", "patient/AllergyIntolerance.s"],
+          capabilities: [{
+            resourceType: "AllergyIntolerance", read: true, readConstraintAlternatives: [[]],
+            search: true, searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/api/fhir/AllergyIntolerance") return jsonResponse(bundle);
+      if (path === "/api/fhir/AllergyIntolerance/allergy-0") {
+        return jsonResponse(bundle.entry[0]!.resource);
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/api/fhir/AllergyIntolerance", "Allergies");
+
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(2);
+    for (const item of timeline.children) {
+      expect(item.children[0]?.getAttribute("datetime")).toBe("2019-07-12");
+      const card = item.children[1]!;
+      expect(card.children.find((child) => child.className === "timeline-date-kind")?.textContent)
+        .toBe("Onset · Recorded");
+      expect(cardDetails(card).get("Recorded")).toContain("2019");
+      expect(cardDetails(card).get("Reaction")).toBe("Rash");
+      expect(card.children.find((child) => child.tagName === "BUTTON")?.disabled).toBe(false);
+    }
+    expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
+      "2 dated events from 2 of 2 records",
+    );
+    expect(JSON.parse(harness.elements["#result"].textContent)).toEqual(bundle);
+
+    await harness.elements["#temporal-graph-order"].dispatch("click");
+    expect(timeline.children).toHaveLength(2);
+    await timeline.children[0]!.children[1]!.children.find((child) => child.tagName === "BUTTON")!
+      .dispatch("click");
+    expect(JSON.parse(harness.elements["#result"].textContent)).toEqual(bundle.entry[0]!.resource);
+  });
+
+  it.each([
+    {
+      name: "different times on the same day",
+      dates: { onsetDateTime: "2019-07-12T09:00:00Z", recordedDate: "2019-07-12T13:26:00Z" },
+      kinds: ["Onset · Recorded"],
+    },
+    {
+      name: "a source day that crosses midnight in UTC",
+      dates: { onsetDateTime: "2019-07-12", recordedDate: "2019-07-12T23:26:00-04:00" },
+      kinds: ["Onset · Recorded"],
+    },
+    {
+      name: "different calendar days",
+      dates: { onsetDateTime: "2019-07-12", recordedDate: "2019-07-13T13:26:00Z" },
+      kinds: ["Onset", "Recorded"],
+    },
+    {
+      name: "different source days within one UTC day",
+      dates: { onsetDateTime: "2019-07-12T23:00:00-04:00", recordedDate: "2019-07-13T04:00:00Z" },
+      kinds: ["Onset", "Recorded"],
+    },
+    {
+      name: "month precision",
+      dates: { onsetDateTime: "2019-07", recordedDate: "2019-07-12T13:26:00Z" },
+      kinds: ["Onset", "Recorded"],
+    },
+    {
+      name: "year precision",
+      dates: { onsetDateTime: "2019", recordedDate: "2019-07-12T13:26:00Z" },
+      kinds: ["Onset", "Recorded"],
+    },
+    {
+      name: "an onset period",
+      dates: { onsetPeriod: { start: "2019-07-12", end: "2019-07-13" }, recordedDate: "2019-07-12T13:26:00Z" },
+      kinds: ["Onset period", "Recorded"],
+    },
+    {
+      name: "an invalid onset",
+      dates: { onsetDateTime: "2019-02-30", recordedDate: "2019-03-02T13:26:00Z" },
+      kinds: ["Recorded"],
+    },
+    {
+      name: "a missing recorded date",
+      dates: { onsetDateTime: "2019-07-12" },
+      kinds: ["Onset"],
+    },
+    {
+      name: "other allergy milestones",
+      dates: {
+        onsetDateTime: "2019-07-12",
+        recordedDate: "2019-07-12T13:26:00Z",
+        reaction: [{ onset: "2019-07-13" }],
+        lastOccurrence: "2019-07-14",
+      },
+      kinds: ["Onset · Recorded", "Reaction onset", "Last occurrence"],
+    },
+  ])("handles $name when merging allergy timeline events", async ({ dates, kinds }) => {
+    const harness = createBrowserHarness(async (path) => {
+      if (path === "/api/connection") {
+        return jsonResponse({
+          connected: true,
+          provider: "Example Health",
+          connectionContext: connectionContextA,
+          connectedAt: "2026-08-24T20:00:00.000Z",
+          scope: ["patient/AllergyIntolerance.s"],
+          capabilities: [{
+            resourceType: "AllergyIntolerance", read: false, readConstraintAlternatives: [],
+            search: true, searchConstraints: [],
+          }],
+        });
+      }
+      if (path === "/api/fhir/AllergyIntolerance") {
+        return jsonResponse({
+          resourceType: "Bundle",
+          type: "searchset",
+          entry: [{ resource: { resourceType: "AllergyIntolerance", id: "allergy-1", ...dates } }],
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await harness.controls.refreshStatus();
+    await harness.controls.runDataRequest("/api/fhir/AllergyIntolerance", "Allergies");
+
+    expect(harness.elements["#temporal-graph-list"].children.map((item) =>
+      item.children[1]?.children.find((child) => child.className === "timeline-date-kind")?.textContent,
+    )).toEqual(kinds);
+  });
+
+  it.each([
+    {
+      name: "Observation effectiveDateTime / issued",
+      resourceType: "Observation", clinicalKind: "Clinically relevant time", recordingKind: "Issued",
+      dates: (recorded: string) => ({ effectiveDateTime: "2020-07-07", issued: recorded }),
+    },
+    {
+      name: "Observation effectiveInstant / issued",
+      resourceType: "Observation", clinicalKind: "Clinically relevant time", recordingKind: "Issued",
+      dates: (recorded: string) => ({ effectiveInstant: "2020-07-07T09:00:00Z", issued: recorded }),
+    },
+    {
+      name: "Observation effectiveTiming / issued",
+      resourceType: "Observation", clinicalKind: "Clinically relevant occurrence", recordingKind: "Issued",
+      dates: (recorded: string) => ({ effectiveTiming: { event: ["2020-07-07T09:00:00Z"] }, issued: recorded }),
+    },
+    {
+      name: "DiagnosticReport effectiveDateTime / issued",
+      resourceType: "DiagnosticReport", clinicalKind: "Clinically relevant time", recordingKind: "Issued",
+      dates: (recorded: string) => ({ effectiveDateTime: "2020-07-07", issued: recorded }),
+    },
+    {
+      name: "DiagnosticReport effectivePeriod / issued",
+      resourceType: "DiagnosticReport", clinicalKind: "Clinically relevant period", recordingKind: "Issued",
+      dates: (recorded: string) => ({
+        effectivePeriod: { start: "2020-07-07T09:00:00Z", end: "2020-07-07T11:00:00Z" }, issued: recorded,
+      }),
+    },
+    {
+      name: "Immunization occurrenceDateTime / recorded",
+      resourceType: "Immunization", clinicalKind: "Administered", recordingKind: "Recorded",
+      dates: (recorded: string) => ({ occurrenceDateTime: "2020-07-07", recorded }),
+    },
+    {
+      name: "Provenance occurredDateTime / recorded",
+      resourceType: "Provenance", clinicalKind: "Occurred", recordingKind: "Recorded",
+      dates: (recorded: string) => ({ occurredDateTime: "2020-07-07", recorded }),
+    },
+    {
+      name: "CarePlan period / created",
+      resourceType: "CarePlan", clinicalKind: "Care plan period", recordingKind: "Created",
+      dates: (recorded: string) => ({
+        period: { start: "2020-07-07", end: "2020-07-07" }, created: recorded,
+      }),
+    },
+    {
+      name: "DocumentReference context.period / date",
+      resourceType: "DocumentReference", clinicalKind: "Document context period", recordingKind: "Indexed",
+      dates: (recorded: string) => ({
+        context: { period: { start: "2020-07-07", end: "2020-07-07" } }, date: recorded,
+      }),
+    },
+  ])("merges same-day $name and preserves different-day recordings", async ({
+    resourceType, clinicalKind, recordingKind, dates,
+  }) => {
+    const resources = ["2020-07-07T15:30:00Z", "2020-07-08T15:30:00Z"].map((recorded, index) => ({
+      resourceType, id: `record-${index}`, ...dates(recorded),
+    }));
+    const harness = await loadTimelineRecords(resources);
+    const timeline = harness.elements["#temporal-graph-list"];
+    const kinds = () => timeline.children.map((item) =>
+      item.children[1]?.children.find((child) => child.className === "timeline-date-kind")?.textContent,
+    );
+    expect(kinds()).toEqual([`${clinicalKind} · ${recordingKind}`, clinicalKind, recordingKind]);
+    const mergedDetails = [...cardDetails(timeline.children[0]?.children[1]).values()];
+    expect(mergedDetails.some((value) => value.includes("2020") && value.includes(":"))).toBe(true);
+    expect(harness.elements["#temporal-graph-summary"].textContent).toContain(
+      "3 dated events from 2 of 2 records",
+    );
+    expect(JSON.parse(harness.elements["#result"].textContent).entry).toEqual(
+      resources.map((resource) => ({ resource })),
+    );
+    await harness.elements["#temporal-graph-order"].dispatch("click");
+    expect(kinds()).toEqual([recordingKind, `${clinicalKind} · ${recordingKind}`, clinicalKind]);
+  });
+
+  it("labels same-day Condition recording while preserving its course and precise dates", async () => {
+    const harness = await loadTimelineRecords([
+      {
+        resourceType: "Condition", id: "active", onsetDateTime: "2020-07-07",
+        recordedDate: "2020-07-07T15:30:00Z",
+      },
+      {
+        resourceType: "Condition", id: "resolved", onsetDateTime: "2020-07-07",
+        recordedDate: "2020-07-07T15:30:00Z", abatementDateTime: "2021-07-07",
+      },
+    ]);
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(2);
+    expect(timeline.children[0]?.children[1]?.children.find(
+      (child) => child.className === "timeline-date-kind",
+    )?.textContent).toBe("Onset · Recorded");
+    expect(timeline.children[1]?.children[0]?.children[0]?.getAttribute("aria-label"))
+      .toContain("Onset · Recorded");
+    expect(timeline.children[1]?.children[0]?.children[2]?.getAttribute("datetime")).toBe("2021-07-07");
+    for (const item of timeline.children) {
+      expect(cardDetails(item.children[1]).get("Recorded")).toContain(":");
+    }
+  });
+
+  it.each(["2020-07-07T12:00:00Z", "2020-07-07T15:30:00Z"])(
+    "preserves repeated clinical occurrences when issued at %s",
+    async (issued) => {
+      const harness = await loadTimelineRecords([{
+        resourceType: "Observation", id: "repeated",
+        effectiveTiming: {
+          event: ["2020-07-07T09:00:00Z", "2020-07-07T09:00:00Z", "2020-07-07T12:00:00Z"],
+        }, issued,
+      }]);
+      const timeline = harness.elements["#temporal-graph-list"];
+      expect(timeline.children.map((item) => item.children[0]?.getAttribute("datetime"))).toEqual([
+        "2020-07-07T09:00:00Z", "2020-07-07T12:00:00Z",
+      ]);
+      const kinds = timeline.children.map((item) => item.children[1]?.children.find(
+        (child) => child.className === "timeline-date-kind",
+      )?.textContent);
+      expect(kinds.filter((kind) => kind?.includes("Issued"))).toHaveLength(1);
+      expect(kinds[issued === "2020-07-07T12:00:00Z" ? 1 : 0]).toContain("Issued");
+      expect(kinds.every((kind) => kind?.split("Clinically relevant occurrence").length === 2)).toBe(true);
+    },
+  );
+
+  it.each([
+    { effectiveDateTime: "2020" },
+    { effectiveDateTime: "2020-07" },
+    { effectivePeriod: { start: "2020-07-07" } },
+    { effectivePeriod: { end: "2020-07-07" } },
+    { effectivePeriod: { start: "2020-07-07", end: "2020-07-08" } },
+    { effectivePeriod: { start: "2020-07", end: "2020-07" } },
+  ])("keeps recording separate when the clinical day is uncertain: %j", async (dates) => {
+    const harness = await loadTimelineRecords([{
+      resourceType: "Observation", id: "uncertain", ...dates, issued: "2020-07-07T15:30:00Z",
+    }]);
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(2);
+    expect(timeline.children[1]?.children[1]?.children.find(
+      (child) => child.className === "timeline-date-kind",
+    )?.textContent).toBe("Issued");
   });
 
   it("coalesces equivalent moments and keeps one timeline card per Condition", async () => {
