@@ -2218,6 +2218,97 @@ describe("legal pages", () => {
     )?.textContent).toBe("Issued");
   });
 
+  it("shows one Encounter card for same-day visit and participant periods", async () => {
+    const visit = { start: "2019-07-12T13:20:00Z", end: "2019-07-12T14:00:00Z" };
+    const participant = { start: "2019-07-12T13:25:00Z", end: "2019-07-12T14:22:00Z" };
+    const resources = ["visit-1", "visit-2"].map((id) => ({
+      resourceType: "Encounter", id, status: "finished", type: [{ text: "Office visit" }],
+      period: visit,
+      participant: [{}, { period: participant }, { period: visit }],
+    }));
+    const harness = await loadTimelineRecords(resources);
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(2);
+    for (const item of timeline.children) {
+      expect(item.children[0]?.getAttribute("datetime")).toBe(visit.start);
+      const card = item.children[1]!;
+      expect(card.children.find((child) => child.className === "timeline-date-kind")?.textContent)
+        .toBe("Encounter period · Participant period");
+      const details = cardDetails(card);
+      const format = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+      expect(details.get("Started")).toBe(format.format(new Date(visit.start)));
+      expect(details.get("Ended")).toBe(format.format(new Date(visit.end)));
+      expect(details.get("Participant period")).toBe(
+        `${format.format(new Date(participant.start))} – ${format.format(new Date(participant.end))}`,
+      );
+    }
+    expect(harness.elements["#temporal-graph-summary"].textContent)
+      .toContain("2 dated events from 2 of 2 records");
+    expect(JSON.parse(harness.elements["#result"].textContent).entry)
+      .toEqual(resources.map((resource) => ({ resource })));
+    await harness.elements["#temporal-graph-order"].dispatch("click");
+    expect(timeline.children).toHaveLength(2);
+  });
+
+  it("groups all same-day Encounter period roles and retains their different times", async () => {
+    const period = (hour: string) => ({
+      start: `2020-07-07T${hour}:00:00Z`, end: `2020-07-07T${hour}:30:00Z`,
+    });
+    const harness = await loadTimelineRecords([{
+      resourceType: "Encounter", id: "visit", period: period("09"),
+      statusHistory: [{ period: period("10") }],
+      classHistory: [{ period: period("11") }],
+      participant: [{ period: period("12") }, { period: period("13") }],
+      location: [{ period: period("14") }],
+    }]);
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children).toHaveLength(1);
+    const card = timeline.children[0]!.children[1]!;
+    expect(card.children.find((child) => child.className === "timeline-date-kind")?.textContent)
+      .toBe("Encounter period · Status period · Class period · Participant period · Location period");
+    const labels = card.children.find((child) => child.tagName === "DL")!.children
+      .filter((child) => child.tagName === "DT").map((child) => child.textContent);
+    expect(labels).toEqual([
+      "Started", "Ended", "Status period", "Class period", "Participant period", "Participant period", "Location period",
+    ]);
+    expect(harness.elements["#temporal-graph-order"].hidden).toBe(true);
+  });
+
+  it.each([
+    { start: "2020-07-08T09:00:00Z", end: "2020-07-08T10:00:00Z" },
+    { start: "2020-07-07T23:00:00Z", end: "2020-07-08T01:00:00Z" },
+    { start: "2020-07-07" },
+    { end: "2020-07-07" },
+    { start: "2020-07", end: "2020-07" },
+  ])("keeps different-day and uncertain participant periods separate: %j", async (participantPeriod) => {
+    const harness = await loadTimelineRecords([{
+      resourceType: "Encounter", id: "visit",
+      period: { start: "2020-07-07T09:00:00Z", end: "2020-07-07T10:00:00Z" },
+      participant: [{ period: participantPeriod }],
+    }]);
+    expect(harness.elements["#temporal-graph-list"].children).toHaveLength(2);
+  });
+
+  it("uses the same period grouping for CareTeam and CarePlan resources", async () => {
+    const period = { start: "2020-07-07T09:00:00Z", end: "2020-07-07T10:00:00Z" };
+    const relatedPeriod = { start: "2020-07-07T09:30:00Z", end: "2020-07-07T10:30:00Z" };
+    const harness = await loadTimelineRecords([
+      { resourceType: "CareTeam", id: "team", period, participant: [{ period: relatedPeriod }] },
+      {
+        resourceType: "CarePlan", id: "plan", period, created: "2020-07-07T08:00:00Z",
+        activity: [{ detail: { scheduledPeriod: relatedPeriod } }],
+      },
+    ]);
+    const timeline = harness.elements["#temporal-graph-list"];
+    expect(timeline.children.map((item) => item.children[1]?.children.find(
+      (child) => child.className === "timeline-date-kind",
+    )?.textContent)).toEqual([
+      "Active period · Member participation period", "Care plan period · Created · Scheduled activity",
+    ]);
+    expect(cardDetails(timeline.children[1]?.children[1]).has("Created")).toBe(true);
+    expect(cardDetails(timeline.children[1]?.children[1]).has("Scheduled activity")).toBe(true);
+  });
+
   it("coalesces equivalent moments and keeps one timeline card per Condition", async () => {
     const harness = createBrowserHarness(async (path) => {
       if (path === "/api/connection") {

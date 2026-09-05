@@ -2530,6 +2530,31 @@ function coalesceTimelineMoments(moments) {
   return coalesced;
 }
 
+function groupTimelinePeriodsByDay(moments) {
+  const grouped = [];
+  const byDay = new Map();
+  for (const moment of moments) {
+    if (!moment.calendarDay || !moment.momentKey.startsWith('period|')) {
+      grouped.push(moment);
+      continue;
+    }
+    const existing = byDay.get(moment.calendarDay);
+    if (!existing) {
+      const firstOnDay = { ...moment, relatedPeriods: [] };
+      byDay.set(moment.calendarDay, firstOnDay);
+      grouped.push(firstOnDay);
+      continue;
+    }
+    // Keep the primary period as the timeline anchor and preserve each other
+    // period inside its card instead of displaying the resource again.
+    existing.dateKind = Array.from(new Set([
+      ...existing.dateKind.split(' · '), ...moment.dateKind.split(' · '),
+    ])).join(' · ');
+    existing.relatedPeriods.push(moment);
+  }
+  return grouped;
+}
+
 function firstTimelineChoice(candidateGroups) {
   for (const candidates of candidateGroups) {
     const present = candidates.filter((candidate) => candidate !== null);
@@ -2783,7 +2808,8 @@ function timelineMomentsForResource(resource) {
 function temporalEventsForResource(resource, sourceIndex) {
   const title = resourceTitle(resource);
   const resourceKind = friendlyResourceName(resource.resourceType);
-  return coalesceTimelineMoments(timelineMomentsForResource(resource)).map((moment, occurrenceIndex) => ({
+  const moments = groupTimelinePeriodsByDay(coalesceTimelineMoments(timelineMomentsForResource(resource)));
+  return moments.map((moment, occurrenceIndex) => ({
     ...moment,
     resource,
     title,
@@ -2939,6 +2965,7 @@ function renderTemporalEventList() {
       timeline: true,
       dateKind: event.undated ? '' : event.dateKind,
       recordingMoment: event.recordingMoment,
+      relatedPeriods: event.relatedPeriods,
     });
     item.append(dateSlot, card);
     temporalGraphList.append(item);
@@ -3032,10 +3059,15 @@ function renderResourceCard(resource, allowDetailAction, options = {}) {
   }
 
   const details = resourceDetails(resource, options);
-  if (isTimelineCard && options.recordingMoment) {
-    const recorded = options.recordingMoment;
-    if (!details.some((detail) => detail.value === recorded.dateLabel)) {
-      details.push({ label: recorded.dateKind, value: recorded.dateLabel });
+  if (isTimelineCard) {
+    const additionalMoments = [
+      options.recordingMoment,
+      ...(options.relatedPeriods || []).flatMap((period) => [period, period.recordingMoment]),
+    ].filter(Boolean);
+    for (const moment of additionalMoments) {
+      if (!details.some((detail) => detail.label === moment.dateKind && detail.value === moment.dateLabel)) {
+        details.push({ label: moment.dateKind, value: moment.dateLabel });
+      }
     }
   }
   if (resource.resourceType === 'Patient' && !isTimelineCard && details.length > 0) {
